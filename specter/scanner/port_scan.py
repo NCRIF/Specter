@@ -48,7 +48,6 @@ from ..libs.port.constants import (
     DIMMER,
     GREEN,
     HTTP_BLOCK_STATUSES,
-    HTTP_PROBE_LIMIT,
     HTTP_PROBE_TIMEOUT,
     LARGE_SCAN_PORT_THRESHOLD,
     LIVE_REFRESH_INTERVAL,
@@ -79,8 +78,9 @@ from ..libs.port.parsers import (
     top_ports,
 )
 from ..libs.port.probes import (
-    extract_title as _extract_title,
     has_http_probe_signal,
+    http_get_response,
+    parse_http_banner,
     should_try_http_probe,
     tls_cert_bits as _tls_cert_bits,
 )
@@ -631,28 +631,6 @@ class Scanner:
 
         return None
 
-    async def _read_http_response(
-        self, reader: asyncio.StreamReader, timeout: float
-    ) -> bytes:
-        buf = bytearray()
-        while len(buf) < HTTP_PROBE_LIMIT:
-            try:
-                chunk = await asyncio.wait_for(reader.read(512), timeout=timeout)
-            except (
-                asyncio.TimeoutError,
-                ConnectionResetError,
-                BrokenPipeError,
-                OSError,
-                ssl.SSLError,
-            ):
-                break
-            if not chunk:
-                break
-            buf.extend(chunk)
-            if b"\r\n\r\n" in buf and b"</title" in buf.lower():
-                break
-        return bytes(buf)
-
     def _probe_fallback(
         self,
         port: int,
@@ -793,18 +771,7 @@ class Scanner:
                     timeout=probe_timeout,
                 )
                 tls_bits = self._tls_info_from_writer(writer) if is_ssl else []
-                request = (
-                    f"GET / HTTP/1.1\r\n"
-                    f"Host: {host_header}\r\n"
-                    f"Connection: close\r\n"
-                    f"Accept: text/html,*/*;q=0.9\r\n"
-                    f"Accept-Encoding: identity\r\n"
-                    f"User-Agent: X3r0Day-Specter/0.1\r\n"
-                    f"\r\n"
-                )
-                writer.write(request.encode())
-                await writer.drain()
-                raw = await self._read_http_response(reader, probe_timeout)
+                raw = await http_get_response(reader, writer, host_header, probe_timeout)
                 if not raw:
                     detail_parts = list(tls_bits)
                     detail_parts.append("accepted TCP but returned no HTTP bytes")
@@ -813,39 +780,12 @@ class Scanner:
                     )
                     continue
 
-                text = raw.decode(errors="ignore")
-                head, _, body = text.partition("\r\n\r\n")
-                lines = head.split("\r\n") if head else text.split("\r\n")
-
+                svc_name, info, status_code = parse_http_banner(raw, port)
+                if is_ssl:
+                    svc_name = "https" if svc_name == "http" else svc_name
                 info_parts = list(tls_bits)
-                svc_name = "https" if is_ssl else "http"
-                status_code = None
-
-                if lines and lines[0].startswith("HTTP/"):
-                    info_parts.append(lines[0])
-                    parts = lines[0].split()
-                    if len(parts) >= 2 and parts[1].isdigit():
-                        status_code = int(parts[1])
-
-                for line in lines[1:]:
-                    low = line.lower()
-                    if low.startswith("server:"):
-                        server = line.split(":", 1)[1].strip()
-                        info_parts.append(f"Server: {server}")
-                        if "nginx" in server.lower():
-                            svc_name = "nginx"
-                        elif "apache" in server.lower():
-                            svc_name = "apache"
-                        elif "cloudflare" in server.lower():
-                            svc_name = "cloudflare"
-                    elif low.startswith("cf-ray:"):
-                        info_parts.append("CF-Ray")
-                    elif low.startswith("location:"):
-                        info_parts.append("Redirect")
-
-                title = _extract_title(body)
-                if title:
-                    info_parts.append(f"Title: {title}")
+                if info:
+                    info_parts.append(info)
 
                 if status_code in HTTP_BLOCK_STATUSES:
                     self._http_probe_blocked = True
@@ -862,7 +802,7 @@ class Scanner:
                     info=" | ".join(info_parts),
                     elapsed=round(time.perf_counter() - t0, 3),
                     n_cmd=n_cmd,
-                    raw=text[:800],
+                    raw=raw.decode(errors="ignore")[:800],
                     err=None,
                 )
             except asyncio.TimeoutError:
@@ -1539,8 +1479,6 @@ class Scanner:
                                 pass
                             finally:
                                 loop.remove_reader(fd)
-                            # socket has data or deadline hit; skip sleep
-                            # hit the deadline; skip the generic sleep below.
                             continue
                         else:
                             await asyncio.sleep(0)
@@ -2070,44 +2008,14 @@ async def _bulk_svc_probe(
                 asyncio.open_connection(ip, port, family=family),
                 timeout=timeout,
             )
-            # send a quick HTTP request
-            request = (
-                f"GET / HTTP/1.1\r\n"
-                f"Host: {target}\r\n"
-                f"Connection: close\r\n"
-                f"Accept: text/html,*/*;q=0.9\r\n"
-                f"User-Agent: X3r0Day-Specter/0.1\r\n\r\n"
-            )
-            writer.write(request.encode())
-            await writer.drain()
-            try:
-                raw = await asyncio.wait_for(reader.read(2048), timeout=timeout)
-            except Exception:
-                raw = b""
-            writer.close()
-            try:
-                await asyncio.wait_for(writer.wait_closed(), timeout=0.2)
-            except Exception:
-                pass
-            text = raw.decode(errors="ignore") if raw else ""
-            head, _, body = text.partition("\r\n\r\n")
-            svc_name = "https" if port == 443 else "http"
-            info_parts = []
-            lines = head.split("\r\n") if head else []
-            if lines and lines[0].startswith("HTTP/"):
-                info_parts.append(lines[0])
-            for line in lines[1:]:
-                if line.lower().startswith("server:"):
-                    info_parts.append(f"Server: {line.split(':',1)[1].strip()}")
-            title = _extract_title(body) if body else ""
-            if title:
-                info_parts.append(f"Title: {title}")
+            raw = await http_get_response(reader, writer, target, timeout)
             elapsed = round(time.perf_counter() - t0, 3)
+            svc_name, info, _ = parse_http_banner(raw, port)
             return (target, port, SvcInfo(
                 port=port, ok=True, state="open",
-                svc=svc_name, info=" | ".join(info_parts),
+                svc=svc_name, info=info,
                 elapsed=elapsed, n_cmd="light http probe",
-                raw=text[:500], err=None,
+                raw=(raw or b"").decode(errors="ignore")[:500], err=None,
             ))
         except Exception:
             elapsed = round(time.perf_counter() - t0, 3)

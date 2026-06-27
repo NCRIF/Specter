@@ -1,9 +1,11 @@
 # this file contains service-probe and TLS formatting helpers
 
 
+import asyncio
 import re
+import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .builders import _clean_text
 from .constants import (
@@ -93,4 +95,68 @@ def tls_cert_bits(cert: Optional[Dict[str, object]]) -> List[str]:
     if expires:
         bits.append(f"TLS Expires: {expires}")
     return bits
+
+
+async def http_get_response(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    host: str,
+    timeout: float,
+) -> bytes:
+    request = (
+        f"GET / HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        f"Connection: close\r\n"
+        f"Accept: text/html,*/*;q=0.9\r\n"
+        f"Accept-Encoding: identity\r\n"
+        f"User-Agent: X3r0Day-Specter/0.1\r\n\r\n"
+    )
+    writer.write(request.encode())
+    await writer.drain()
+    try:
+        raw = await asyncio.wait_for(reader.read(4096), timeout=timeout)
+    except Exception:
+        raw = b""
+    writer.close()
+    try:
+        await asyncio.wait_for(writer.wait_closed(), timeout=0.2)
+    except Exception:
+        pass
+    return raw
+
+
+def parse_http_banner(raw: bytes, port: int) -> Tuple[str, str, int]:
+    svc_name = "https" if port == 443 else "http"
+    status_code = 0
+    if not raw:
+        return svc_name, "", status_code
+    text = raw.decode(errors="ignore")
+    head, _, body = text.partition("\r\n\r\n")
+    lines = head.split("\r\n") if head else text.split("\r\n")
+    parts: List[str] = []
+    if lines and lines[0].startswith("HTTP/"):
+        parts.append(lines[0])
+        tok = lines[0].split()
+        if len(tok) >= 2 and tok[1].isdigit():
+            status_code = int(tok[1])
+    for line in lines[1:]:
+        low = line.lower()
+        if low.startswith("server:"):
+            srv = line.split(":", 1)[1].strip()
+            parts.append(f"Server: {srv}")
+            srv_low = srv.lower()
+            if "cloudflare" in srv_low:
+                svc_name = "cloudflare"
+            elif "nginx" in srv_low:
+                svc_name = "nginx"
+            elif "apache" in srv_low:
+                svc_name = "apache"
+        elif low.startswith("cf-ray:"):
+            parts.append("CF-Ray")
+        elif low.startswith("location:"):
+            parts.append("Redirect")
+    title = extract_title(body) if body else ""
+    if title:
+        parts.append(f"Title: {title}")
+    return svc_name, " | ".join(parts), status_code
 
