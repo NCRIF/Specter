@@ -18,7 +18,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import select
 from rich.console import Console
@@ -34,15 +34,12 @@ from ..libs.port.builders import (
     build_scan_html,
     console as port_console,
     hdr as port_hdr,
-    hr as port_hr,
-    live_disc_tbl,
     mk_prog as port_mk_prog,
     open_tbl as port_open_tbl,
     out_mode as port_out_mode,
     scan_csv as port_scan_csv,
     show_multi_sum as port_show_multi_sum,
     show_scan as port_show_scan,
-    state_label,
     sum_tbl as port_sum_tbl,
 )
 from ..libs.port.constants import (
@@ -64,13 +61,10 @@ from ..libs.port.constants import (
     WHITE,
     YELLOW,
 )
-from ..libs.port.models import Cfg, ScanCfg, ScanOut, SvcInfo
+from ..libs.port.models import Cfg, ScanOut, SvcInfo
 from ..libs.port.network import DynamicSemaphore, sock_addr
 from ..libs.port.packets import (
     build_syn_packet,
-    build_tcp_header,
-    build_tcp_pseudo_header,
-    checksum,
     parse_tcp_response,
 )
 from ..libs.port.parsers import (
@@ -79,7 +73,6 @@ from ..libs.port.parsers import (
     guess_svc_meta,
     merge_nmap_rows,
     parse_nmap_ignored_counts,
-    parse_nmap_row,
     parse_nmap_rows,
     parse_nmap_xml_rows,
     parse_ports,
@@ -106,8 +99,6 @@ HTTP_SSL_CTX.check_hostname = False
 HTTP_SSL_CTX.verify_mode = ssl.CERT_NONE
 
 
-# Presentation and report construction live in libs/port/builders.
-hr = port_hr
 hdr = port_hdr
 mk_prog = port_mk_prog
 open_tbl = port_open_tbl
@@ -139,33 +130,30 @@ class Scanner:
         self._syn_tracking_lock = asyncio.Lock()
         self._syn_receiver_lock = asyncio.Lock()
         self._syn_receiver_running = False
+        self._syn_sock_ready = False
 
-        # create raw socket for SYN scan if enabled
-        if cfg.syn_scan:
+    def _ensure_syn_socket(self, target_ip: str):
+        if self._syn_sock_ready:
+            return
+        if not self.cfg.syn_scan:
+            return
+        try:
+            self._raw_sock = socket.socket(
+                socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP
+            )
+            self._raw_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 0)
+            self._raw_sock.setblocking(False)
+            # discover source IP via a throwaway UDP connect
             try:
-                self._raw_sock = socket.socket(
-                    socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP
-                )
-                self._raw_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 0)
-                self._raw_sock.setblocking(False)
-                # get source IP by connecting to the target (or use 0.0.0.0)
-                try:
-                    test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    test_sock.connect(
-                        (
-                            cfg.target
-                            if self._target_is_ip
-                            else socket.gethostbyname(cfg.target),
-                            80,
-                        )
-                    )
-                    self._src_ip = test_sock.getsockname()[0]
-                    test_sock.close()
-                except Exception:
-                    self._src_ip = "0.0.0.0"
-            except PermissionError:
-                # will be caught during validation anyways
-                pass
+                test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                test_sock.connect((target_ip, 80))
+                self._src_ip = test_sock.getsockname()[0]
+                test_sock.close()
+            except Exception:
+                self._src_ip = "0.0.0.0"
+            self._syn_sock_ready = True
+        except PermissionError:
+            pass
 
     def _reset_scan_state(self):
         self._svc_tasks = []
@@ -235,7 +223,7 @@ class Scanner:
                 "max_window": max(1, min(self.cfg.c_conc, 192)),
                 "min_window": max(1, min(self.cfg.c_conc, 24)),
                 "increase": 4,
-                "max_retries": 1,
+                "max_retries": self.cfg.max_retries,
                 "retry_budget": max(8, min(port_count // 8, 64)),
                 "timeout_floor": min(self.cfg.c_to, 0.50),
             }
@@ -249,7 +237,7 @@ class Scanner:
                 "max_window": max_window,
                 "min_window": min_window,
                 "increase": 32,
-                "max_retries": 1,
+                "max_retries": self.cfg.max_retries,
                 "retry_budget": max(64, min(port_count // 32, 1024)),
                 "timeout_floor": min(self.cfg.c_to, 0.75),
             }
@@ -263,7 +251,7 @@ class Scanner:
                 "max_window": max_window,
                 "min_window": min_window,
                 "increase": 32,
-                "max_retries": 1,
+                "max_retries": self.cfg.max_retries,
                 "retry_budget": max(32, min(port_count // 16, 256)),
                 "timeout_floor": min(self.cfg.c_to, 0.50),
             }
@@ -274,7 +262,7 @@ class Scanner:
             "max_window": max(start_window, self.cfg.c_conc),
             "min_window": max(64, min(start_window, 256)),
             "increase": 16,
-            "max_retries": 1,
+            "max_retries": self.cfg.max_retries,
             "retry_budget": max(8, min(port_count // 4, 64)),
             "timeout_floor": min(self.cfg.c_to, 0.35),
         }
@@ -286,6 +274,9 @@ class Scanner:
         live_ports: List[int],
         force: bool = False,
     ):
+        # quiet mode: skip lock and Rich rendering
+        if self.cfg.quiet:
+            return
         now = time.perf_counter()
         async with self._lock:
             if not force and now < self._live_next_refresh:
@@ -970,6 +961,15 @@ class Scanner:
         )
 
     async def _resolve(self, host: str):
+        # skip getaddrinfo for bare IPs
+        try:
+            ip = ipaddress.ip_address(host)
+            family = socket.AF_INET if ip.version == 4 else socket.AF_INET6
+            self._resolved_candidates = [host]
+            return host, family
+        except ValueError:
+            pass
+
         loop = asyncio.get_running_loop()
         last_err = None
 
@@ -1517,6 +1517,29 @@ class Scanner:
                 if pending or inflight:
                     if scan_delay > 0.0:
                         await asyncio.sleep(scan_delay)
+                    elif inflight and not pending:
+                        now = time.perf_counter()
+                        earliest = min(st for _, st in inflight.values())
+                        remaining = (earliest + dyn_timeout) - now
+                        if remaining > 0.003:
+                            loop = asyncio.get_running_loop()
+                            fut: asyncio.Future = loop.create_future()
+                            fd = raw_sock.fileno()
+                            def _on_readable(f: asyncio.Future = fut):
+                                if not f.done():
+                                    f.set_result(None)
+                            loop.add_reader(fd, _on_readable)
+                            try:
+                                await asyncio.wait_for(fut, timeout=remaining)
+                            except asyncio.TimeoutError:
+                                pass
+                            finally:
+                                loop.remove_reader(fd)
+                            # socket has data or deadline hit; skip sleep
+                            # hit the deadline; skip the generic sleep below.
+                            continue
+                        else:
+                            await asyncio.sleep(0)
                     elif got_response:
                         await asyncio.sleep(0)
                     else:
@@ -1687,6 +1710,7 @@ class Scanner:
         t0 = time.perf_counter()
         ip, family = await self._resolve(self.cfg.target)
         self._resolved_ip = ip
+        self._ensure_syn_socket(ip)
         use_syn_scan = (
             self.cfg.syn_scan
             and family == socket.AF_INET
@@ -1709,24 +1733,37 @@ class Scanner:
                 )
 
         live_ports: List[int] = []
-        prog = mk_prog(transient=False)
-        tid = prog.add_task(f"Scanning {self.cfg.target}", total=len(ports))
-        live_console = console
+
+        # no-op stubs for quiet mode
         if self.cfg.quiet:
-            live_console = Console(
+            _null_console = Console(
                 file=io.StringIO(),
                 highlight=False,
                 force_terminal=False,
                 color_system=None,
             )
-
-        live = Live(
-            build_live_panel(prog, live_ports, self.cfg.target),
-            console=live_console,
-            refresh_per_second=8,
-            transient=True,
-        )
-        live.start()
+            prog: Any = type("_P", (), {
+                "add_task": lambda self, *a, **kw: 0,
+                "advance": lambda self, tid: None,
+                "update": lambda self, tid, **kw: None,
+            })()
+            tid: Any = prog.add_task("", total=len(ports))
+            live: Any = type("_L", (), {
+                "console": _null_console,
+                "start": lambda self: None,
+                "stop": lambda self: None,
+                "update": lambda self, *a, **kw: None,
+            })()
+        else:
+            prog = mk_prog(transient=False)
+            tid = prog.add_task(f"Scanning {self.cfg.target}", total=len(ports))
+            live = Live(
+                build_live_panel(prog, live_ports, self.cfg.target),
+                console=console,
+                refresh_per_second=8,
+                transient=True,
+            )
+            live.start()
 
         try:
             if self.cfg.sudo_pw is not None:
@@ -1743,7 +1780,7 @@ class Scanner:
                         await self._scan_syn(
                             ip, family, ports, prog, tid, live, live_ports
                         )
-                    elif hasattr(select, "epoll"):
+                    elif hasattr(select, "epoll") and not self.cfg.quiet:
                         await self._scan_epoll(
                             ip, family, ports, prog, tid, live, live_ports
                         )
@@ -1753,12 +1790,13 @@ class Scanner:
                         )
             elif use_syn_scan:
                 await self._scan_syn(ip, family, ports, prog, tid, live, live_ports)
-            elif hasattr(select, "epoll"):
+            elif hasattr(select, "epoll") and not self.cfg.quiet:
                 await self._scan_epoll(ip, family, ports, prog, tid, live, live_ports)
             else:
                 await self._scan_asyncio(ip, family, ports, prog, tid, live, live_ports)
         finally:
-            live.stop()
+            if not self.cfg.quiet:
+                live.stop()
             await self._stop_syn_receiver()
             if self._raw_sock is not None:
                 self._raw_sock.close()
@@ -1846,6 +1884,235 @@ async def scan_quiet(
         globals()["console"] = orig_console
 
 
+async def _scan_targets_parallel(
+    targets: List[str],
+    ports: List[int],
+    c_conc: int,
+    c_to: float,
+    s_conc: int,
+    n_args: List[str],
+    svc_on: bool,
+    aggr_on: bool,
+    sudo_pw: Optional[str],
+    stealth: bool,
+    syn_scan: bool,
+    verbose: int,
+    target_concurrency: int,
+    quiet: bool,
+) -> List:
+    total = len(targets)
+    started_all = datetime.now(timezone.utc)
+    t0 = time.perf_counter()
+
+    sem: Optional[asyncio.Semaphore] = None
+    if target_concurrency and target_concurrency > 0:
+        sem = asyncio.Semaphore(target_concurrency)
+
+    async def _resolve_one(target: str) -> tuple:
+        try:
+            ip = ipaddress.ip_address(target)
+            return (target, str(ip), socket.AF_INET if ip.version == 4 else socket.AF_INET6, None)
+        except ValueError:
+            pass
+        loop = asyncio.get_running_loop()
+        try:
+            infos = await loop.getaddrinfo(target, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+            for family, _st, _pr, _cn, sockaddr in infos:
+                if family in (socket.AF_INET, socket.AF_INET6):
+                    return (target, sockaddr[0], family, None)
+            return (target, "", 0, f"no supported address family")
+        except Exception as err:
+            return (target, "", 0, str(err))
+
+    resolve_tasks = [asyncio.create_task(_resolve_one(t)) for t in targets]
+    resolved = await asyncio.gather(*resolve_tasks)
+
+    connect_sem = asyncio.Semaphore(max(1, c_conc))
+    per_target: Dict[str, Dict] = {}
+
+    for target, ip, family, err in resolved:
+        per_target[target] = {
+            "ip": ip,
+            "family": family,
+            "open": [],
+            "probes": {},
+            "err": err,
+        }
+
+    async def _probe_one(target: str, ip: str, family: int, port: int):
+        if not ip or family == 0:
+            return (target, port, "closed", 0.0)
+        async with connect_sem:
+            t1 = time.perf_counter()
+            try:
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, port, family=family),
+                    timeout=c_to,
+                )
+                writer.close()
+                if hasattr(writer, "wait_closed"):
+                    try:
+                        await asyncio.wait_for(writer.wait_closed(), timeout=0.2)
+                    except Exception:
+                        pass
+                return (target, port, "open", time.perf_counter() - t1)
+            except Exception:
+                return (target, port, "closed", time.perf_counter() - t1)
+
+    probe_tasks = []
+    for target, ip, family, _err in resolved:
+        if not ip or family == 0:
+            continue
+        for port in ports:
+            probe_tasks.append(
+                asyncio.create_task(_probe_one(target, ip, family, port))
+            )
+
+    if not probe_tasks:
+        return []
+
+    probe_results = await asyncio.gather(*probe_tasks)
+
+    for target, port, state, elapsed in probe_results:
+        if state == "open":
+            per_target[target]["open"].append(port)
+        per_target[target]["probes"][port] = (state, elapsed)
+
+    if svc_on and not aggr_on:
+        svc_sem = asyncio.Semaphore(max(1, s_conc))
+        svc_tasks = []
+        for target, info in per_target.items():
+            if not info["open"] or not info["ip"]:
+                continue
+            for port in info["open"]:
+                svc_tasks.append(
+                    asyncio.create_task(
+                        _bulk_svc_probe(target, info["ip"], port, svc_sem, c_to,
+                                        info["family"] if info["family"] else socket.AF_INET)
+                    )
+                )
+        if svc_tasks:
+            svc_results = await asyncio.gather(*svc_tasks, return_exceptions=True)
+            for res in svc_results:
+                if isinstance(res, tuple) and len(res) == 3:
+                    target, port, svc_hit = res
+                    per_target[target]["probes"][port] = svc_hit
+
+    results: List[Optional[ScanHit]] = [None] * total
+    completed = 0
+    t1_total = time.perf_counter()
+
+    for i, target in enumerate(targets):
+        info = per_target.get(target, {})
+        ip = info.get("ip", "")
+        open_ports = sorted(info.get("open", []))
+        svcs = []
+        for port in open_ports:
+            probe_data = info.get("probes", {}).get(port)
+            if isinstance(probe_data, SvcInfo):
+                svcs.append(probe_data)
+            else:
+                svcs.append(SvcInfo(
+                    port=port, ok=True, state="open",
+                    svc=guess_svc(port), info="",
+                    elapsed=probe_data[1] if isinstance(probe_data, tuple) else 0.0,
+                    n_cmd="", raw="", err=None,
+                ))
+
+        err_str = info.get("err")
+        errors = [err_str] if err_str else []
+        results[i] = ScanHit(
+            target=target, ip=ip,
+            req_ports=list(ports),
+            open_ports=open_ports,
+            svcs=svcs,
+            started=started_all.isoformat(),
+            finished=datetime.now(timezone.utc).isoformat(),
+            elapsed=round(t1_total - t0, 3),
+            errors=errors,
+        )
+        completed += 1
+        if not quiet:
+            n_open = len(open_ports)
+            status = f"{n_open} open" if n_open else "no open ports"
+            color = GREEN if n_open else DIM
+            console.print(
+                Text.assemble(
+                    ("  [", DIM),
+                    (f"{completed}/{total}", WHITE),
+                    ("] ", DIM),
+                    (target, WHITE),
+                    ("  →  ", DIM),
+                    (status, color),
+                )
+            )
+
+    if not quiet:
+        tag = f"bulk x{target_concurrency}" if target_concurrency else "bulk (uncapped)"
+        console.print(Text(f"  Targets  {total}  ·  {tag}", style=DIM))
+        console.print()
+
+    return results
+
+
+async def _bulk_svc_probe(
+    target: str, ip: str, port: int,
+    sem: asyncio.Semaphore, timeout: float, family: int,
+):
+    async with sem:
+        t0 = time.perf_counter()
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port, family=family),
+                timeout=timeout,
+            )
+            # send a quick HTTP request
+            request = (
+                f"GET / HTTP/1.1\r\n"
+                f"Host: {target}\r\n"
+                f"Connection: close\r\n"
+                f"Accept: text/html,*/*;q=0.9\r\n"
+                f"User-Agent: X3r0Day-Specter/0.1\r\n\r\n"
+            )
+            writer.write(request.encode())
+            await writer.drain()
+            try:
+                raw = await asyncio.wait_for(reader.read(2048), timeout=timeout)
+            except Exception:
+                raw = b""
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=0.2)
+            except Exception:
+                pass
+            text = raw.decode(errors="ignore") if raw else ""
+            head, _, body = text.partition("\r\n\r\n")
+            svc_name = "https" if port == 443 else "http"
+            info_parts = []
+            lines = head.split("\r\n") if head else []
+            if lines and lines[0].startswith("HTTP/"):
+                info_parts.append(lines[0])
+            for line in lines[1:]:
+                if line.lower().startswith("server:"):
+                    info_parts.append(f"Server: {line.split(':',1)[1].strip()}")
+            title = _extract_title(body) if body else ""
+            if title:
+                info_parts.append(f"Title: {title}")
+            elapsed = round(time.perf_counter() - t0, 3)
+            return (target, port, SvcInfo(
+                port=port, ok=True, state="open",
+                svc=svc_name, info=" | ".join(info_parts),
+                elapsed=elapsed, n_cmd="light http probe",
+                raw=text[:500], err=None,
+            ))
+        except Exception:
+            elapsed = round(time.perf_counter() - t0, 3)
+            return (target, port, SvcInfo(
+                port=port, ok=True, state="open",
+                svc=guess_svc(port), info="",
+                elapsed=elapsed, n_cmd="", raw="", err=None,
+            ))
+
 
 # main entry point
 def run_cli(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> int:
@@ -1875,53 +2142,62 @@ def run_cli(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> int
     # determine scan mode
     use_syn_scan = args.syn_scan
 
-    # check for root privileges if SYN scan is enabled
+    # SYN scan: probe raw socket, prompt for sudo on failure, fall back to connect
     if use_syn_scan and os.geteuid() != 0:
-        console.print()
-        console.print(Text("  SYN scan requires root privileges.", style=YELLOW))
-        console.print(
-            Text(
-                "  Use the default connect scan for non-privileged scanning.", style=DIM
+        can_syn = False
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+            probe.close()
+            can_syn = True
+        except PermissionError:
+            pass
+
+        if not can_syn:
+            console.print()
+            console.print(Text("  SYN scan requires raw socket access.", style=YELLOW))
+            console.print(
+                Text("  Provide sudo password to auto-elevate, or Ctrl-C to abort.", style=DIM)
             )
-        )
-        console.print()
+            console.print()
 
-        # prompt for sudo password and re-execute with sudo
-        sudo_pw = getpass.getpass("  sudo password: ")
+            try:
+                sudo_pw = getpass.getpass("  sudo password: ")
+            except (EOFError, KeyboardInterrupt):
+                console.print()
+                console.print(Text("  Falling back to TCP connect scan.", style=DIM))
+                console.print()
+                use_syn_scan = False
+            else:
+                # test sudo authentication
+                check = subprocess.run(
+                    ["sudo", "-S", "-p", "", "-v"],
+                    input=sudo_pw + "\n",
+                    text=True,
+                    capture_output=True,
+                )
+                if check.returncode != 0:
+                    console.print(Text("  ERROR  sudo authentication failed.", style=RED))
+                    return 2
 
-        # test sudo authentication
-        check = subprocess.run(
-            ["sudo", "-S", "-p", "", "-v"],
-            input=sudo_pw + "\n",
-            text=True,
-            capture_output=True,
-        )
+                # re-execute with sudo using the script path
+                import sys
+                if __file__:
+                    script_path = __file__
+                else:
+                    script_path = sys.argv[0]
 
-        if check.returncode != 0:
-            console.print(Text("  ERROR  sudo authentication failed.", style=RED))
-            return 2
+                sudo_cmd = ["sudo", "-S", sys.executable, script_path] + (
+                    argv if argv else sys.argv[1:]
+                )
+                console.print(Text("  Elevating privileges...", style=DIM))
+                console.print()
 
-        # re-execute with sudo using the script path
-        import sys
-
-        # if running as a module, convert to file path
-        if __file__:
-            script_path = __file__
-        else:
-            script_path = sys.argv[0]
-
-        sudo_cmd = ["sudo", "-S", sys.executable, script_path] + (
-            argv if argv else sys.argv[1:]
-        )
-        console.print(Text("  Elevating privileges...", style=DIM))
-        console.print()
-
-        proc = subprocess.run(
-            sudo_cmd,
-            input=sudo_pw + "\n",
-            text=True,
-        )
-        return proc.returncode
+                proc = subprocess.run(
+                    sudo_cmd,
+                    input=sudo_pw + "\n",
+                    text=True,
+                )
+                return proc.returncode
 
     # sudo handling
     sudo_pw = None
@@ -1967,15 +2243,15 @@ def run_cli(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> int
         syn_scan=use_syn_scan,
         verbose=args.v,
         quiet=args.quiet,
+        max_retries=args.retries,
     )
     if not args.quiet:
         hdr(targets, len(sel), scan_cfg)
 
-    # scan each target
-    runs: List[ScanHit] = []
-    for target in targets:
+    if len(targets) == 1:
+        runs: List[ScanHit] = []
         cfg = Cfg(
-            target=target,
+            target=targets[0],
             ports=list(sel),
             c_conc=args.concurrency,
             c_to=args.timeout,
@@ -1988,17 +2264,48 @@ def run_cli(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> int
             syn_scan=use_syn_scan,
             verbose=args.v,
             quiet=args.quiet,
+            max_retries=args.retries,
         )
         try:
             scan = asyncio.run(Scanner(cfg).run())
         except Exception as err:
             t = Text()
             t.append("  ERROR  ", style=f"bold {RED}")
-            t.append(f"{target}: {err}", style=DIM)
+            t.append(f"{targets[0]}: {err}", style=DIM)
             console.print(t)
-            continue
+            return 1
         runs.append(scan)
-        show_scan(scan, idx=len(runs) - 1, total=len(targets), verbose=args.v)
+        show_scan(scan, idx=0, total=1, verbose=args.v)
+    else:
+        raw = asyncio.run(
+            _scan_targets_parallel(
+                targets=targets,
+                ports=sel,
+                c_conc=args.concurrency,
+                c_to=args.timeout,
+                s_conc=args.svc_concurrency,
+                n_args=parsed_n_args,
+                svc_on=not args.no_svc_scan,
+                aggr_on=use_nmap_service_detection,
+                sudo_pw=sudo_pw,
+                stealth=args.stealth,
+                syn_scan=use_syn_scan,
+                verbose=args.v,
+                target_concurrency=args.target_concurrency,
+                quiet=args.quiet,
+            )
+        )
+        runs = []
+        for i, result in enumerate(raw):
+            if isinstance(result, Exception):
+                t = Text()
+                t.append("  ERROR  ", style=f"bold {RED}")
+                t.append(f"{targets[i]}: {result}", style=DIM)
+                console.print(t)
+                continue
+            if isinstance(result, ScanHit):
+                runs.append(result)
+                show_scan(result, idx=len(runs) - 1, total=len(targets), verbose=args.v)
 
     # show multi-target summary
     show_multi_sum(runs)
@@ -2031,16 +2338,6 @@ def run_cli(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> int
     return 0
 
 
-# compatibility aliases
-res_tbl = open_tbl
-stats_tbl = sum_tbl
-show = show_scan
-multi_sum = show_multi_sum
-_csv_scan = _scan_csv
-build_html = build_scan_html
-mk_parser = build_parser
-
-
 def main():
     raise SystemExit(run_cli())
 
@@ -2051,7 +2348,6 @@ if __name__ == "__main__":
 
 __all__ = [
     "Cfg",
-    "ScanCfg",
     "ScanOut",
     "Scanner",
     "SvcInfo",
@@ -2059,12 +2355,6 @@ __all__ = [
     "build_parser",
     "build_scan_html",
     "build_syn_packet",
-    "build_tcp_header",
-    "build_tcp_pseudo_header",
-    "checksum",
-    "live_disc_tbl",
-    "parse_nmap_row",
     "run_cli",
     "scan_quiet",
-    "state_label",
 ]

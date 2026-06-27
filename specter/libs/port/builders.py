@@ -634,6 +634,22 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
         help="concurrent service scan limit (default: 20)",
     )
     p.add_argument(
+        "-T",
+        "--target-concurrency",
+        type=int,
+        default=0,
+        metavar="N",
+        help="max concurrent targets (default: 0 = unlimited, adaptive backpressure)",
+    )
+    p.add_argument(
+        "-R",
+        "--retries",
+        type=int,
+        default=1,
+        metavar="N",
+        help="max retries per port on timeout (default: 1, set 0 for speed)",
+    )
+    p.add_argument(
         "-S",
         "--aggr-svc-scan",
         action="store_true",

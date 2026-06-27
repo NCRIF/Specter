@@ -22,6 +22,7 @@ class ScanCfg:
     syn_scan: bool
     verbose: int = 0
     quiet: bool = False
+    max_retries: int = 1
 
 
 Cfg = ScanCfg

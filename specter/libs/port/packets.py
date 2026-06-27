@@ -61,7 +61,7 @@ def build_syn_packet(src_ip: str, dst_ip: str, src_port: int, dst_port: int) -> 
             0x02,
             socket.htons(65535),
         )
-        + struct.pack("H", checksum_val)
+        + struct.pack("!H", checksum_val)
         + struct.pack("!H", 0)
     )
 
