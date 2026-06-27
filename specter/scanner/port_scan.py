@@ -310,10 +310,6 @@ class Scanner:
                 self._open_ports.append(port)
                 live_ports.append(port)
                 announce_open = True
-                # basic probes can overlap discovery, but aggressive nmap
-                # service detection is faster when batched after discovery.
-                # but on larger scale, overlapping them is faster due to obvious reason
-                # TODO: Implement parallel service scanning on large scale scans
                 queue_svc = self.cfg.svc_on and not self.cfg.aggr_on
             elif state == "filtered":
                 self._filtered += 1
@@ -334,6 +330,18 @@ class Scanner:
 
         if queue_svc:
             await self._queue_service_detection(port)
+
+    def _finish_port_sync(self, port: int, state: str, live_ports: List[int]):
+        if state == "open":
+            self._open += 1
+            self._open_ports.append(port)
+            live_ports.append(port)
+        elif state == "filtered":
+            self._filtered += 1
+        else:
+            self._closed += 1
+        self._tested += 1
+        self._st[port] = state
 
     async def _run_nmap(self, base_cmd: List[str]):
         cmd = list(base_cmd)
@@ -1424,9 +1432,7 @@ class Scanner:
                         pending.appendleft(port)
                         break
                     except OSError:
-                        await self._finish_port(
-                            port, "filtered", prog, tid, live_ports, live
-                        )
+                        self._finish_port_sync(port, "filtered", live_ports)
                         continue
 
                     inflight[src_port] = (port, time.perf_counter())
@@ -1463,7 +1469,7 @@ class Scanner:
                     inflight.pop(resp_dst_port, None)
                     rtt = max(time.perf_counter() - started_at, 0.001)
                     update_rtt(rtt)
-                    await self._finish_port(port, state, prog, tid, live_ports, live)
+                    self._finish_port_sync(port, state, live_ports)
                     got_response = True
 
                 now = time.perf_counter()
@@ -1485,9 +1491,7 @@ class Scanner:
                         self._st[port] = "retrying"
                         pending.appendleft(port)
                     else:
-                        await self._finish_port(
-                            port, "filtered", prog, tid, live_ports, live
-                        )
+                        self._finish_port_sync(port, "filtered", live_ports)
 
                 if expired_count:
                     timeout_ratio = expired_count / max(
