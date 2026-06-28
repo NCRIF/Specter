@@ -32,6 +32,7 @@ env/
 htmlcov/
 .tox/
 .nox/
+test/
 
 # ide
 .idea/
@@ -56,6 +57,8 @@ testsImpl.md
 temp/
 tests/
 PLAN.md
+logs/
+scan.html
 
 # ruff
 .ruff_cache/

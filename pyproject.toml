@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "x3r0day-specter"
+name = "specter"
 version = "2.1.0"
 description = "Subdomain enumeration and TCP port scanning."
 readme = "README.md"
