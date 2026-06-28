@@ -18,6 +18,6 @@ _PKG_NAME = "specter"
 try:
     __version__ = version(_PKG_NAME)
 except PackageNotFoundError:
-    __version__ = "2.2.1"
+    __version__ = "2.3.0"
 
 __all__ = ["__version__"]
