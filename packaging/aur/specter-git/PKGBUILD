@@ -1,22 +1,19 @@
 # Maintainer: X3r0Day
 
 pkgname=specter-git
-pkgver=2.0.0.r0.g0000000
+pkgver=2.2.0.r0.g0000000
 pkgrel=1
 pkgdesc="Subdomain enumeration and TCP port scanning toolkit"
 arch=("any")
 url="https://github.com/x3r0day/x3r0day-specter"
 license=("GPL3")
-depends=("python" "python-rich")
+depends=("python" "python-rich" "nmap")
 makedepends=(
   "git"
   "python-build"
   "python-installer"
   "python-setuptools"
   "python-wheel"
-)
-optdepends=(
-  "nmap: aggressive service detection (-S) and sudo nmap mode (-U)"
 )
 provides=("specter")
 conflicts=("specter")
