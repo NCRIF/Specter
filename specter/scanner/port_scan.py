@@ -1474,6 +1474,7 @@ class Scanner:
                 elif scan_delay > 0.0:
                     scan_delay = max(0.0, scan_delay / 2.0)
 
+                prog.update(tid, completed=self._tested)
                 await self._maybe_refresh_live(live, prog, live_ports)
 
                 if pending or inflight:
@@ -1505,6 +1506,7 @@ class Scanner:
                     else:
                         await asyncio.sleep(0.001)
         finally:
+            prog.update(tid, completed=self._tested)
             await self._maybe_refresh_live(live, prog, live_ports, force=True)
 
     async def _scan_asyncio(
