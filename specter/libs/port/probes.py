@@ -3,9 +3,7 @@
 
 import asyncio
 import re
-import time
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
 
 from .builders import _clean_text
 from .constants import (
@@ -17,7 +15,7 @@ from .constants import (
 )
 
 
-def should_try_http_probe(port: int, guessed_svc: str, guess_source: str) -> bool:
+def should_try_http_probe(port, guessed_svc, guess_source):
     low = guessed_svc.lower()
     if port in WEB_PORTS or port in TLS_WEB_PORTS:
         return True
@@ -30,7 +28,7 @@ def should_try_http_probe(port: int, guessed_svc: str, guess_source: str) -> boo
     return False
 
 
-def has_http_probe_signal(res) -> bool:
+def has_http_probe_signal(res):
     if res.err is not None:
         return False
     raw = (res.raw or "").lstrip().lower()
@@ -45,22 +43,22 @@ def has_http_probe_signal(res) -> bool:
     )
 
 
-def extract_title(text: str) -> str:
+def extract_title(text):
     match = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
     if not match:
         return ""
     return _clean_text(match.group(1), HTTP_TITLE_MAX)
 
 
-def _flatten_cert_name(parts) -> Dict[str, str]:
-    flat: Dict[str, str] = {}
+def _flatten_cert_name(parts):
+    flat = {}
     for item in parts or ():
         for key, value in item:
             flat[key] = value
     return flat
 
 
-def _fmt_cert_date(raw: str) -> str:
+def _fmt_cert_date(raw):
     if not raw:
         return ""
     normalized = re.sub(r"\s+", " ", raw.strip())
@@ -72,11 +70,11 @@ def _fmt_cert_date(raw: str) -> str:
         return normalized
 
 
-def tls_cert_bits(cert: Optional[Dict[str, object]]) -> List[str]:
+def tls_cert_bits(cert):
     if not cert:
         return []
 
-    bits: List[str] = []
+    bits = []
     subject = _flatten_cert_name(cert.get("subject"))
     common_name = subject.get("commonName", "")
     if common_name:
@@ -98,11 +96,11 @@ def tls_cert_bits(cert: Optional[Dict[str, object]]) -> List[str]:
 
 
 async def http_get_response(
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
-    host: str,
-    timeout: float,
-) -> bytes:
+    reader,
+    writer,
+    host,
+    timeout,
+):
     request = (
         f"GET / HTTP/1.1\r\n"
         f"Host: {host}\r\n"
@@ -125,7 +123,7 @@ async def http_get_response(
     return raw
 
 
-def parse_http_banner(raw: bytes, port: int) -> Tuple[str, str, int]:
+def parse_http_banner(raw, port):
     svc_name = "https" if port == 443 else "http"
     status_code = 0
     if not raw:
@@ -133,7 +131,7 @@ def parse_http_banner(raw: bytes, port: int) -> Tuple[str, str, int]:
     text = raw.decode(errors="ignore")
     head, _, body = text.partition("\r\n\r\n")
     lines = head.split("\r\n") if head else text.split("\r\n")
-    parts: List[str] = []
+    parts = []
     if lines and lines[0].startswith("HTTP/"):
         parts.append(lines[0])
         tok = lines[0].split()

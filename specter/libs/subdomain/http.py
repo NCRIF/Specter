@@ -4,7 +4,6 @@
 import urllib.error
 import urllib.request
 from html.parser import HTMLParser
-from typing import Dict, Tuple
 
 from .constants import HTTP_TO, SSL_CTX, UA
 
@@ -29,10 +28,10 @@ class TitleParser(HTMLParser):
 
 
 def http_get(
-    url: str,
-    timeout: float = HTTP_TO,
-    max_bytes: int = 5 << 20,
-) -> Tuple[int, bytes, Dict[str, str], str]:
+    url,
+    timeout = HTTP_TO,
+    max_bytes = 5 << 20,
+):
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as resp:

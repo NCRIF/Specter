@@ -1,7 +1,6 @@
 # this file contains all the constant values for port scanners
 
 
-from typing import Dict
 
 
 # colors we use throughout
@@ -53,7 +52,7 @@ HTTP_BLOCK_STATUSES = {403, 429, 503}
 
 # port -> service name mapping
 # most common ports, saves us from calling nmap for basic stuff
-PORT2SVC: Dict[int, str] = {
+PORT2SVC = {
     20: "ftp-data",
     21: "ftp",
     22: "ssh",

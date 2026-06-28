@@ -7,7 +7,7 @@ import socket
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Set, Tuple
+from typing import List
 
 from .constants import (
     DNS_CNAME_MAX,
@@ -36,11 +36,11 @@ class DnsResult:
     fallback: bool = False
 
 
-def load_nameservers() -> List[str]:
+def load_nameservers():
     conf = Path("/etc/resolv.conf")
     if not conf.exists():
         return []
-    nameservers: List[str] = []
+    nameservers = []
     for line in conf.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or not line.startswith("nameserver"):
@@ -51,14 +51,14 @@ def load_nameservers() -> List[str]:
     return nameservers
 
 
-def dns_addr(nameserver: str):
+def dns_addr(nameserver):
     family = socket.AF_INET6 if ":" in nameserver else socket.AF_INET
     if family == socket.AF_INET6:
         return family, (nameserver, DNS_PORT, 0, 0)
     return family, (nameserver, DNS_PORT)
 
 
-def encode_name(name: str) -> bytes:
+def encode_name(name):
     labels = [label for label in name.strip(".").split(".") if label]
     return (
         b"".join(
@@ -69,11 +69,11 @@ def encode_name(name: str) -> bytes:
     )
 
 
-def decode_name(packet: bytes, offset: int) -> Tuple[str, int]:
-    labels: List[str] = []
+def decode_name(packet, offset):
+    labels = []
     current = offset
     next_offset = None
-    seen: Set[int] = set()
+    seen = set()
     while True:
         if current >= len(packet):
             raise DnsError("dns name exceeds packet bounds")
@@ -100,7 +100,7 @@ def decode_name(packet: bytes, offset: int) -> Tuple[str, int]:
     return ".".join(labels), next_offset if next_offset is not None else current
 
 
-def make_query(name: str, qtype: int) -> Tuple[int, bytes]:
+def make_query(name, qtype):
     txid = secrets.randbelow(65536)
     header = struct.pack("!HHHHHH", txid, 0x0100, 1, 0, 0, 0)
     question = encode_name(name) + struct.pack("!HH", qtype, DNS_IN)
@@ -108,8 +108,8 @@ def make_query(name: str, qtype: int) -> Tuple[int, bytes]:
 
 
 def parse_response(
-    packet: bytes, txid: int, qtype: int
-) -> Tuple[List[str], List[str], bool, int]:
+    packet, txid, qtype
+):
     if len(packet) < 12:
         raise DnsError("dns packet too short")
     response_id, flags, qdcount, ancount, _nscount, _arcount = struct.unpack(
@@ -126,8 +126,8 @@ def parse_response(
         if offset > len(packet):
             raise DnsError("dns question truncated")
 
-    answers: List[str] = []
-    cnames: List[str] = []
+    answers = []
+    cnames = []
     for _ in range(ancount):
         _, offset = decode_name(packet, offset)
         if offset + 10 > len(packet):
@@ -156,11 +156,11 @@ def parse_response(
 
 
 class DnsResolver:
-    def __init__(self, timeout: float = DNS_TO):
+    def __init__(self, timeout = DNS_TO):
         self._to = timeout
         self._ns = load_nameservers()
 
-    async def _query(self, nameserver: str, name: str, qtype: int) -> DnsResult:
+    async def _query(self, nameserver, name, qtype):
         loop = asyncio.get_running_loop()
         txid, query = make_query(name, qtype)
         family, addr = dns_addr(nameserver)
@@ -185,7 +185,7 @@ class DnsResolver:
             return DnsResult([], fallback=True)
         return DnsResult([])
 
-    async def _lookup(self, name: str, qtype: int, depth: int = 0) -> DnsResult:
+    async def _lookup(self, name, qtype, depth = 0):
         if depth > DNS_CNAME_MAX or not self._ns:
             return DnsResult([], fallback=True)
         need_fallback = False
@@ -209,7 +209,7 @@ class DnsResolver:
                 return result
         return DnsResult([], fallback=need_fallback)
 
-    async def resolve(self, host: str) -> str:
+    async def resolve(self, host):
         ipv4, ipv6 = await asyncio.gather(
             self._lookup(host, DNS_QTYPE_A),
             self._lookup(host, DNS_QTYPE_AAAA),

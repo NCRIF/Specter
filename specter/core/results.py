@@ -3,7 +3,7 @@ shared result models for scans and service hits
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 
 @dataclass
@@ -18,7 +18,7 @@ class SvcHit:
     raw: str
     err: Optional[str] = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self):
         return {
             "port": self.port,
             "ok": self.ok,
@@ -44,7 +44,7 @@ class ScanHit:
     elapsed: float
     errors: List[str]
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self):
         return {
             "target": self.target,
             "ip": self.ip,

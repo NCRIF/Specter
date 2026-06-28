@@ -6,7 +6,6 @@ import argparse
 import sys
 from pathlib import Path
 from textwrap import dedent
-from typing import List, Optional
 
 from . import __version__
 from .scanner.port_scan import run_cli as run_port_scan
@@ -28,7 +27,7 @@ SCAN_CMDS = {"scan", "portscan"}
 SUB_CMDS = {"subdomain", "sub", "enum"}
 
 
-def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
+def build_parser(prog = None):
     tool = prog or "specter"
     ap = argparse.ArgumentParser(
         prog=tool,
@@ -58,7 +57,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
     return ap
 
 
-def _help_cmd(argv: List[str], ap: argparse.ArgumentParser, tool: str) -> int:
+def _help_cmd(argv, ap, tool):
     if not argv:
         ap.print_help()
         return 0
@@ -76,7 +75,7 @@ def _help_cmd(argv: List[str], ap: argparse.ArgumentParser, tool: str) -> int:
     return 2
 
 
-def main(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> int:
+def main(argv = None, prog = None):
     argv = list(sys.argv[1:] if argv is None else argv)
     tool = prog or Path(sys.argv[0]).name or "specter"
     ap = build_parser(prog=tool)

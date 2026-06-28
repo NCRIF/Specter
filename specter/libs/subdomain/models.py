@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 
 @dataclass
@@ -19,7 +19,7 @@ class SubHit:
     elapsed: float
     err: Optional[str] = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self):
         return self.__dict__
 
 
@@ -34,7 +34,7 @@ class SubRun:
     elapsed: float
     errors: List[str]
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self):
         data = dict(self.__dict__)
         data["subdomains"] = [sub.to_dict() for sub in self.subdomains]
         return data

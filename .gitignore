@@ -59,6 +59,8 @@ tests/
 PLAN.md
 logs/
 scan.html
+test.html
+test.gnmap
 
 # ruff
 .ruff_cache/

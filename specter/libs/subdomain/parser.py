@@ -3,10 +3,9 @@
 
 import argparse
 from pathlib import Path
-from typing import Optional
 
 
-def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
+def build_parser(prog = None):
     parser = argparse.ArgumentParser(
         prog=prog,
         description="async subdomain enumerator: passive sources + async port scans + scraping",

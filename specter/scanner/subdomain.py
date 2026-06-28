@@ -10,7 +10,6 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
 
 from rich.console import Console
 from rich.live import Live
@@ -68,9 +67,9 @@ from .port_scan import scan_quiet
 # helpers are located in ../libs/subdomain.
 
 class SubScanner:
-    def __init__(self, cfg: Cfg):
+    def __init__(self, cfg):
         self.cfg = cfg
-        self._found: Set[str] = set()
+        self._found = set()
         self._lock = asyncio.Lock()
         self._resolve_sem = asyncio.Semaphore(cfg.resolve_c)
         self._nmap_sem = asyncio.Semaphore(cfg.nmap_c)
@@ -84,15 +83,15 @@ class SubScanner:
             thread_name_prefix="sub-dns-fallback",
         )
         self._dns = _Dns()
-        self._res_cache: Dict[str, str] = {}
-        self._errors: List[str] = []
+        self._res_cache = {}
+        self._errors = []
         self._total_raw = 0
 
-    def _v(self, msg: str):
+    def _v(self, msg):
         if self.cfg.verbose > 0 and not self.cfg.quiet:
             console.print(Text(f"  {msg}", style=DIMMER))
 
-    def _err(self, msg: str):
+    def _err(self, msg):
         self._errors.append(msg)
         if self.cfg.verbose > 0 and not self.cfg.quiet:
             console.print(Text(f"  !  {msg}", style=YELLOW))
@@ -100,10 +99,10 @@ class SubScanner:
     # keep blocking urllib work off the event loop
     async def _aget(
         self,
-        url: str,
-        to: float = HTTP_TO,
-        max_b: int = 5 << 20,
-    ) -> Tuple[int, bytes, Dict[str, str], str]:
+        url,
+        to = HTTP_TO,
+        max_b = 5 << 20,
+    ):
         async with self._http_sem:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
@@ -111,7 +110,7 @@ class SubScanner:
             )
 
     # libc fallback for truncated replies or dns servers that misbehave
-    async def _sys_resolve(self, host: str) -> str:
+    async def _sys_resolve(self, host):
         loop = asyncio.get_running_loop()
         try:
             infos = await asyncio.wait_for(
@@ -131,11 +130,11 @@ class SubScanner:
                 return sockaddr[0]
         return ""
 
-    def close(self) -> None:
+    def close(self):
         self._http_pool.shutdown(wait=False, cancel_futures=True)
         self._dns_pool.shutdown(wait=False, cancel_futures=True)
 
-    async def _src_crtsh(self, domain: str) -> List[Tuple[str, str]]:
+    async def _src_crtsh(self, domain):
         url = CRTSH_URL.format(d=domain)
         try:
             # crt.sh can be painfully slow on larger domains
@@ -144,7 +143,7 @@ class SubScanner:
                 self._err(f"crt.sh: empty response (http {code}), {err}")
                 return []
             rows = json.loads(body.decode("utf-8", errors="replace"))
-            subs: Set[str] = set()
+            subs = set()
             for row in rows:
                 for val in str(row.get("name_value", "")).splitlines():
                     val = val.strip().lower().lstrip("*.")
@@ -158,7 +157,7 @@ class SubScanner:
             self._err(f"crt.sh: {exc}")
             return []
 
-    async def _src_hackertarget(self, domain: str) -> List[Tuple[str, str]]:
+    async def _src_hackertarget(self, domain):
         url = HACKERTARGET_URL.format(d=domain)
         try:
             code, body, _, err = await self._aget(url)
@@ -169,7 +168,7 @@ class SubScanner:
             if text.lower().startswith("error") or "api count" in text.lower():
                 self._err(f"hackertarget: rate limited, {text[:80]}")
                 return []
-            subs: Set[str] = set()
+            subs = set()
             for line in text.splitlines():
                 parts = line.split(",")
                 if parts:
@@ -181,7 +180,7 @@ class SubScanner:
             self._err(f"hackertarget: {exc}")
             return []
 
-    async def _src_alienvault(self, domain: str) -> List[Tuple[str, str]]:
+    async def _src_alienvault(self, domain):
         url = ALIENVAULT_URL.format(d=domain)
         try:
             code, body, _, err = await self._aget(url)
@@ -189,7 +188,7 @@ class SubScanner:
                 self._err(f"alienvault: empty response (http {code}) {err}")
                 return []
             data = json.loads(body.decode("utf-8", errors="replace"))
-            subs: Set[str] = set()
+            subs = set()
             for rec in data.get("passive_dns", []):
                 hostname = str(rec.get("hostname", "")).strip().lower()
                 if hostname.endswith(f".{domain}") or hostname == domain:
@@ -202,7 +201,7 @@ class SubScanner:
             self._err(f"alienvault: {exc}")
             return []
 
-    async def _src_urlscan(self, domain: str) -> List[Tuple[str, str]]:
+    async def _src_urlscan(self, domain):
         url = URLSCAN_URL.format(d=domain)
         try:
             code, body, _, err = await self._aget(url)
@@ -210,7 +209,7 @@ class SubScanner:
                 self._err(f"urlscan: empty response (http {code}) {err}")
                 return []
             data = json.loads(body.decode("utf-8", errors="replace"))
-            subs: Set[str] = set()
+            subs = set()
             for result in data.get("results", []):
                 for key in ("task", "page"):
                     dm = result.get(key, {}).get("domain", "")
@@ -224,7 +223,7 @@ class SubScanner:
             self._err(f"urlscan: {exc}")
             return []
 
-    async def _src_rapiddns(self, domain: str) -> List[Tuple[str, str]]:
+    async def _src_rapiddns(self, domain):
         url = RAPIDDNS_URL.format(d=domain)
         try:
             code, body, _, err = await self._aget(url)
@@ -232,7 +231,7 @@ class SubScanner:
                 self._err(f"rapiddns: empty response (http {code}) {err}")
                 return []
             text = body.decode("utf-8", errors="replace")
-            subs: Set[str] = set()
+            subs = set()
             pat = r"<td[^>]*>\s*([\w.\-]+\." + re.escape(domain) + r")\s*</td>"
             for m in re.finditer(pat, text):
                 s = m.group(1).strip().lower()
@@ -248,7 +247,7 @@ class SubScanner:
             self._err(f"rapiddns: {exc}")
             return []
 
-    async def _src_shodan(self, domain: str, key: str) -> List[Tuple[str, str]]:
+    async def _src_shodan(self, domain, key):
         url = SHODAN_DNS_URL.format(d=domain, k=key)
         try:
             code, body, _, err = await self._aget(url)
@@ -259,7 +258,7 @@ class SubScanner:
             if "error" in data:
                 self._err(f"shodan: {data['error']}")
                 return []
-            subs: Set[str] = set()
+            subs = set()
             for sub in data.get("subdomains", []):
                 subs.add(f"{sub}.{domain}".lower())
             for rec in data.get("data", []):
@@ -274,11 +273,11 @@ class SubScanner:
             self._err(f"shodan: {exc}")
             return []
 
-    async def _src_brute(self, domain: str, words: List[str]) -> List[Tuple[str, str]]:
-        results: List[Tuple[str, str]] = []
+    async def _src_brute(self, domain, words):
+        results = []
         lock = asyncio.Lock()
 
-        async def _try(word: str):
+        async def _try(word):
             candidate = f"{word}.{domain}"
             async with self._lock:
                 if candidate in self._found:
@@ -292,7 +291,7 @@ class SubScanner:
 
     # dns resolution
 
-    async def _resolve(self, host: str) -> str:
+    async def _resolve(self, host):
         if host in self._res_cache:
             return self._res_cache[host]
 
@@ -312,7 +311,7 @@ class SubScanner:
                 self._res_cache[host] = ""
                 return ""
 
-    async def _scan_web(self, sub: str, ip: str) -> List[int]:
+    async def _scan_web(self, sub, ip):
         if not self.cfg.nmap_on:
             return []
 
@@ -339,8 +338,8 @@ class SubScanner:
     # web scraping
 
     async def _scrape_port(
-        self, sub: str, port: int, https: bool
-    ) -> Tuple[int, str, str, List[str]]:
+        self, sub, port, https
+    ):
         scheme = "https" if https else "http"
         url = f"{scheme}://{sub}/" if port in (80, 443) else f"{scheme}://{sub}:{port}/"
 
@@ -364,7 +363,7 @@ class SubScanner:
         server = hl.get("server", "")
 
         # tech detection: headers first, then body patterns
-        tech: List[str] = []
+        tech = []
         for hdr_name in ("x-powered-by", "x-generator", "x-cms", "x-drupal-cache"):
             val = hl.get(hdr_name, "")
             if val and val not in tech:
@@ -406,8 +405,8 @@ class SubScanner:
     """
 
     async def _scrape(
-        self, sub: str, open_ports: List[int]
-    ) -> Tuple[int, str, str, List[str]]:
+        self, sub, open_ports
+    ):
         if not self.cfg.scrape_on or not open_ports:
             return 0, "", "", []
 
@@ -425,13 +424,13 @@ class SubScanner:
 
     async def _process_sub(
         self,
-        sub: str,
-        sources: List[str],
-        prog: Progress,
-        tid: Any,
-        live: Live,
-        live_subs: List[SubHit],
-    ) -> SubHit:
+        sub,
+        sources,
+        prog,
+        tid,
+        live,
+        live_subs,
+    ):
         t0 = time.perf_counter()
 
         ip = await self._resolve(sub)
@@ -472,14 +471,14 @@ class SubScanner:
 
     # main entry point
 
-    async def run(self) -> SubRun:
+    async def run(self):
         started = datetime.now(timezone.utc)
         t0 = time.perf_counter()
         domain = self.cfg.domain
 
         # phase 1: passive enumeration
         #
-        # all sources fire simultaneously; results merged into sub -> [sources]
+        # all sources fire simultaneously, results merged into sub -> [sources]
         # per-source counts printed immediately so you can see what's working
         #
 
@@ -505,7 +504,7 @@ class SubScanner:
         batch = await asyncio.gather(*source_coros, return_exceptions=True)
 
         # merge + print per-source result counts
-        sub_sources: Dict[str, List[str]] = {}
+        sub_sources = {}
         if not self.cfg.quiet:
             console.print()
 
@@ -572,7 +571,7 @@ class SubScanner:
                 hr("Brute Force")
                 console.print()
 
-            words: List[str] = list(WORDLIST)
+            words = list(WORDLIST)
             if self.cfg.wordlist and self.cfg.wordlist.exists():
                 extra = self.cfg.wordlist.read_text(
                     encoding="utf-8", errors="ignore"
@@ -618,14 +617,14 @@ class SubScanner:
 
         # phase 3: parallel resolve + port scan + scrape
         #
-        # each subdomain: resolve dns → port scan + scrape in parallel
+        # each subdomain: resolve dns -> port scan + scrape in parallel
         # _resolve_sem and _nmap_sem prevent thundering-herd
 
         if not self.cfg.quiet:
             hr("Resolve  ·  Port Scan  ·  Scrape")
             console.print()
 
-        live_subs: List[SubHit] = []
+        live_subs = []
         prog = mk_prog(transient=False)
         tid = prog.add_task(
             f"Processing {len(subs_list)} subdomains", total=len(subs_list)
@@ -647,9 +646,9 @@ class SubScanner:
             transient=True,
         )
 
-        all_results: List[SubHit] = []
+        all_results = []
 
-        async def _run_one(sub: str):
+        async def _run_one(sub):
             info = await self._process_sub(
                 sub, sub_sources[sub], prog, tid, live, live_subs
             )
@@ -698,7 +697,7 @@ class SubScanner:
         )
 
 
-def run_cli(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> int:
+def run_cli(argv = None, prog = None):
     parser = build_parser(prog=prog)
     args = parser.parse_args(argv)
 

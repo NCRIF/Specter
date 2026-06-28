@@ -6,7 +6,6 @@ import html
 import io
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Tuple
 
 from rich import box
 from rich.console import Console, Group
@@ -32,7 +31,7 @@ from .models import SubCfg, SubHit, SubRun
 console = Console(highlight=False)
 
 
-def hr(title: str = "") -> None:
+def hr(title = ""):
     if title:
         console.print(
             Rule(title=Text(f"  {title}  ", style=DIMMER), style=BORDER, align="left")
@@ -41,7 +40,7 @@ def hr(title: str = "") -> None:
         console.print(Rule(style=BORDER))
 
 
-def hdr(domain: str, cfg: SubCfg) -> None:
+def hdr(domain, cfg):
     console.print()
     hr()
     title = Text()
@@ -83,7 +82,7 @@ def hdr(domain: str, cfg: SubCfg) -> None:
     console.print()
 
 
-def mk_prog(transient: bool = True) -> Progress:
+def mk_prog(transient = True):
     return Progress(
         SpinnerColumn(spinner_name="dots2", style=CYAN),
         TextColumn("  [bold white]{task.description}[/bold white]"),
@@ -99,7 +98,7 @@ def mk_prog(transient: bool = True) -> Progress:
     )
 
 
-def live_disc_tbl(subs: List[SubHit], domain: str) -> Table:
+def live_disc_tbl(subs, domain):
     tbl = Table(
         box=box.ROUNDED,
         show_header=True,
@@ -123,15 +122,15 @@ def live_disc_tbl(subs: List[SubHit], domain: str) -> Table:
     return tbl
 
 
-def build_live_panel(progress: Progress, subs: List[SubHit], domain: str) -> Group:
-    parts: List[Any] = [progress]
+def build_live_panel(progress, subs, domain):
+    parts = [progress]
     if subs:
         parts.append(Text(""))
         parts.append(live_disc_tbl(subs, domain))
     return Group(*parts)
 
 
-def _status_style(code: int) -> Tuple[str, str]:
+def _status_style(code):
     if code == 0:
         return DIM, "-"
     if 200 <= code < 300:
@@ -143,7 +142,7 @@ def _status_style(code: int) -> Tuple[str, str]:
     return DIM, str(code)
 
 
-def _fmt_display_ts(raw: str) -> str:
+def _fmt_display_ts(raw):
     try:
         dt = datetime.fromisoformat(raw)
     except ValueError:
@@ -153,7 +152,7 @@ def _fmt_display_ts(raw: str) -> str:
     return dt.strftime("%Y-%m-%d  %H:%M:%S")
 
 
-def sub_tbl(run: SubRun) -> Table:
+def sub_tbl(run):
     tbl = Table(
         box=box.SIMPLE_HEAD,
         show_header=True,
@@ -185,7 +184,7 @@ def sub_tbl(run: SubRun) -> Table:
     return tbl
 
 
-def sum_tbl(run: SubRun) -> Table:
+def sum_tbl(run):
     web_hits = sum(1 for sub in run.subdomains if sub.ports)
     grid = Table.grid(padding=(0, 4))
     for width in (13, 20, 13, 22, 13, 18):
@@ -219,7 +218,7 @@ def sum_tbl(run: SubRun) -> Table:
     return grid
 
 
-def show_run(run: SubRun) -> None:
+def show_run(run):
     console.print()
     console.print(
         Panel(
@@ -247,7 +246,7 @@ def show_run(run: SubRun) -> None:
     console.print()
 
 
-def out_mode(raw: str):
+def out_mode(raw):
     out = Path(raw)
     if not out.suffix:
         return out.with_name(out.name + ".html"), "html"
@@ -258,7 +257,7 @@ def out_mode(raw: str):
     return out, "html"
 
 
-def sub_csv(run: SubRun) -> str:
+def sub_csv(run):
     buf = io.StringIO()
     fields = [
         "domain", "subdomain", "ip", "sources", "ports", "status", "title",
@@ -288,7 +287,7 @@ def sub_csv(run: SubRun) -> str:
     return buf.getvalue()
 
 
-def build_sub_html(run: SubRun) -> str:
+def build_sub_html(run):
     found = run.total_found
     resolved = run.total_resolved
     web_hits = sum(1 for sub in run.subdomains if sub.ports)

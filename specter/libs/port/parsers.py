@@ -5,14 +5,13 @@ import re
 import socket
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List, Optional
 
 from .constants import NMAP_DB, PORT2SVC
 
 
 
 # helper functions
-def guess_svc_meta(port: int):
+def guess_svc_meta(port):
     """
     We guess the service through a chain
     we first  use PORT2SVC
@@ -29,13 +28,13 @@ def guess_svc_meta(port: int):
         return "unknown", "none"
 
 
-def guess_svc(port: int) -> str:
+def guess_svc(port):
     svc, _source = guess_svc_meta(port)
     return svc
 
 
 
-def parse_nmap_rows(out: str) -> Dict[int, Dict[str, str]]:
+def parse_nmap_rows(out):
     # parses nmap text output:
     
     # 22/tcp   open   ssh     OpenSSH 8.4p1 Debian 5
@@ -44,7 +43,7 @@ def parse_nmap_rows(out: str) -> Dict[int, Dict[str, str]]:
     
     # and returns the good dict structure
     
-    rows: Dict[int, Dict[str, str]] = {}
+    rows = {}
     for line in out.splitlines():
         #   (\d+)                   - port number
         #   \/tcp                   - for only fetching TCP
@@ -65,14 +64,14 @@ def parse_nmap_rows(out: str) -> Dict[int, Dict[str, str]]:
             }
     return rows
 
-def _nmap_xml_info(service_el: Optional[ET.Element], port_el: ET.Element) -> str:
+def _nmap_xml_info(service_el, port_el):
     # we take the nmap output and save it into our own format
 
     # xml already has the service metadata from the <service> element
     # (product name, version, extrainfo) and we also append
     # any nse script output found in child <script> elements
 
-    info_parts: List[str] = []
+    info_parts = []
 
     # we collect all the structured attribs from service element
     # we'll extract product, version, extrainfo
@@ -95,7 +94,7 @@ def _nmap_xml_info(service_el: Optional[ET.Element], port_el: ET.Element) -> str
 
 
 
-def parse_nmap_row(out: str):
+def parse_nmap_row(out):
     
     # nmap outputs stuff like this:
 
@@ -109,9 +108,9 @@ def parse_nmap_row(out: str):
         return None
     return rows[sorted(rows)[0]]
 
-_top_ports_cache: Optional[List[int]] = None
+_top_ports_cache = None
 
-def top_ports(n: int) -> List[int]:
+def top_ports(n):
     global _top_ports_cache
     if _top_ports_cache is None:
         _top_ports_cache = _load_top_ports(max_n=65535)
@@ -120,7 +119,7 @@ def top_ports(n: int) -> List[int]:
     return _top_ports_cache[:n]
 
 
-def _load_top_ports(max_n: int) -> List[int]:
+def _load_top_ports(max_n):
     for db_path in NMAP_DB:
         p = Path(db_path)
         if not p.exists():
@@ -181,14 +180,14 @@ def _load_top_ports(max_n: int) -> List[int]:
 
     return list(range(1, min(max_n, 65535) + 1))
 
-def parse_ports(raw: Optional[str]) -> List[int]:
+def parse_ports(raw):
     # default to well-known ports (1-1024) if nothing given
     if not raw:
         return list(range(1, 1025))
 
     # we use set so we can dedupe the port numbers incase the user duplicates it
     # if user provides (80, 80-85) it'll dedupe 80
-    out: set = set()
+    out = set()
 
     # splits on commas
     # each chunk is either a single port or range
@@ -223,7 +222,7 @@ def parse_ports(raw: Optional[str]) -> List[int]:
 
     return sorted(out)
 
-def _nmap_xml_svc_name(service_el: Optional[ET.Element], port: int) -> str:
+def _nmap_xml_svc_name(service_el, port):
     if service_el is None:
         return guess_svc(port)
 
@@ -240,8 +239,8 @@ def _nmap_xml_svc_name(service_el: Optional[ET.Element], port: int) -> str:
 
 
 
-def parse_nmap_xml_rows(xml_text: str) -> Dict[int, Dict[str, str]]:
-    rows: Dict[int, Dict[str, str]] = {}
+def parse_nmap_xml_rows(xml_text):
+    rows = {}
     if not xml_text.strip():
         return rows
 
@@ -285,7 +284,7 @@ def parse_nmap_xml_rows(xml_text: str) -> Dict[int, Dict[str, str]]:
     return rows
 
 
-def parse_nmap_ignored_counts(out: str) -> Dict[str, int]:
+def parse_nmap_ignored_counts(out):
     counts = {"closed": 0, "filtered": 0}
 
     for line in out.splitlines():
@@ -311,10 +310,10 @@ def parse_nmap_ignored_counts(out: str) -> Dict[str, int]:
 
 
 def merge_nmap_rows(
-    text_rows: Dict[int, Dict[str, str]],
-    xml_rows: Dict[int, Dict[str, str]],
-) -> Dict[int, Dict[str, str]]:
-    merged: Dict[int, Dict[str, str]] = {}
+    text_rows,
+    xml_rows,
+):
+    merged = {}
     for port in sorted(set(text_rows) | set(xml_rows)):
         row = dict(xml_rows.get(port, {}))
         for key, value in text_rows.get(port, {}).items():
@@ -324,7 +323,7 @@ def merge_nmap_rows(
     return merged
 
 
-def grab_nmap_block(out: str, port: int) -> str:
+def grab_nmap_block(out, port):
     lines = out.splitlines()
     needle = f"{port}/tcp"
     idx = None

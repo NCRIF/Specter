@@ -1,12 +1,7 @@
 import os
-import shlex
 import shutil
 import subprocess
-import sys
-import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Optional
 
 AGENT_LABEL = "x3r0-agent"
 DEFAULT_IMAGE = os.environ.get("X3R0_AGENT_IMAGE", "x3r0/warp-agent:v4")
@@ -93,8 +88,11 @@ def agent_scan(name, targets, ports_str, timeout, out_file, extra_args=None, ret
     container_pid = pid[1].strip()
 
     specter_bin = shutil.which("specter") or os.path.expanduser("~/.local/bin/specter")
+    # PYTHONDONTWRITEBYTECODE: the agent runs specter as root via nsenter, so keep
+    # it from writing root-owned __pycache__ into the user-owned install.
     nsenter_cmd = [
         "nsenter", "-t", container_pid, "-n", "--",
+        "env", "PYTHONDONTWRITEBYTECODE=1",
         specter_bin, "scan",
     ] + targets + [
         "-p", ports_str,

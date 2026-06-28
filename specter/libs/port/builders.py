@@ -7,7 +7,6 @@ import html
 import io
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
 
 from rich import box
 from rich.console import Console, Group
@@ -51,7 +50,7 @@ console = Console(highlight=False)
 
 
 # build live discovery table showing ports as they're found
-def live_disc_tbl(open_ports: List[int], target: str) -> Table:
+def live_disc_tbl(open_ports, target):
     tbl = Table(
         box=box.ROUNDED,
         show_header=True,
@@ -76,7 +75,7 @@ def live_disc_tbl(open_ports: List[int], target: str) -> Table:
 
     return tbl
 
-def _clean_text(value: str, limit: int = 0) -> str:
+def _clean_text(value, limit = 0):
     text = " ".join(html.unescape(value).split())
     if limit > 0 and len(text) > limit:
         return text[: limit - 3] + "..."
@@ -88,7 +87,7 @@ def _clean_text(value: str, limit: int = 0) -> str:
 # main builders functions
 
 # build combined renderable: progress bar + discovered ports table
-def build_live_panel(progress: Progress, open_ports: List[int], target: str) -> Group:
+def build_live_panel(progress, open_ports, target):
     parts = [progress]
     if open_ports:
         parts.append(Text(""))  # spacer
@@ -96,7 +95,7 @@ def build_live_panel(progress: Progress, open_ports: List[int], target: str) -> 
     return Group(*parts)
 
 
-def hr(title: str = "") -> None:
+def hr(title = ""):
     if title:
         console.print(
             Rule(title=Text(f"  {title}  ", style=DIMMER), style=BORDER, align="left")
@@ -105,11 +104,11 @@ def hr(title: str = "") -> None:
         console.print(Rule(style=BORDER))
 
 
-def _probe_detail_panel(scan: ScanHit, verbose: int) -> Optional[Panel]:
+def _probe_detail_panel(scan, verbose):
     if verbose <= 0 or not scan.svcs:
         return None
 
-    lines: List[Text] = []
+    lines = []
     for svc in sorted(scan.svcs, key=lambda item: item.port):
         head = Text.assemble(
             (f"{svc.port:>5}/tcp", f"bold {WHITE}"),
@@ -137,7 +136,7 @@ def _probe_detail_panel(scan: ScanHit, verbose: int) -> Optional[Panel]:
     )
 
 
-def hdr(hosts: List[str], total_ports: int, cfg: ScanCfg) -> None:
+def hdr(hosts, total_ports, cfg):
     console.print()
     hr()
     title = Text()
@@ -188,7 +187,7 @@ def hdr(hosts: List[str], total_ports: int, cfg: ScanCfg) -> None:
     console.print()
 
 
-def mk_prog(transient: bool = True) -> Progress:
+def mk_prog(transient = True):
     return Progress(
         SpinnerColumn(spinner_name="dots2", style=CYAN),
         TextColumn("  [bold white]{task.description}[/bold white]"),
@@ -204,7 +203,7 @@ def mk_prog(transient: bool = True) -> Progress:
     )
 
 
-def state_label(state: str) -> Text:
+def state_label(state):
     mapping = {
         "open": (GREEN, "open"),
         "closed": (RED, "closed"),
@@ -215,7 +214,7 @@ def state_label(state: str) -> Text:
     return Text(label, style=style)
 
 
-def open_tbl(scan: ScanHit) -> Table:
+def open_tbl(scan):
     tbl = Table(
         box=box.SIMPLE_HEAD,
         show_header=True,
@@ -245,7 +244,7 @@ def open_tbl(scan: ScanHit) -> Table:
     return tbl
 
 
-def sum_tbl(scan: ScanHit) -> Table:
+def sum_tbl(scan):
     total = len(scan.req_ports)
     opened = len(scan.open_ports)
     filtered = getattr(scan, "_filtered_count", 0)
@@ -285,7 +284,7 @@ def sum_tbl(scan: ScanHit) -> Table:
     return grid
 
 
-def show_scan(scan: ScanHit, idx: int = 0, total: int = 1, verbose: int = 0) -> None:
+def show_scan(scan, idx = 0, total = 1, verbose = 0):
     console.print()
     if total > 1:
         hr(f"Target {idx + 1}/{total}")
@@ -321,7 +320,7 @@ def show_scan(scan: ScanHit, idx: int = 0, total: int = 1, verbose: int = 0) -> 
     console.print()
 
 
-def show_multi_sum(runs: List[ScanHit]) -> None:
+def show_multi_sum(runs):
     if len(runs) < 2:
         return
     console.print()
@@ -370,7 +369,7 @@ def show_multi_sum(runs: List[ScanHit]) -> None:
     console.print()
 
 
-def out_mode(raw: str):
+def out_mode(raw):
     out = Path(raw)
     if not out.suffix:
         return out.with_name(out.name + ".html"), "html"
@@ -381,7 +380,7 @@ def out_mode(raw: str):
     return out, "html"
 
 
-def scan_csv(runs: List[ScanHit]) -> str:
+def scan_csv(runs):
     buf = io.StringIO()
     fields = [
         "target",
@@ -437,7 +436,7 @@ def scan_csv(runs: List[ScanHit]) -> str:
 
 
 # build unified html report
-def build_scan_html(runs: List[ScanHit]) -> str:
+def build_scan_html(runs):
     lines = [
         "<!DOCTYPE html>",
         "<html lang='en'>",
@@ -592,7 +591,7 @@ def build_scan_html(runs: List[ScanHit]) -> str:
 
 
 # build argument parser
-def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
+def build_parser(prog = None):
     p = argparse.ArgumentParser(
         prog=prog,
         description="async tcp port scanner with realtime per-port service detection",
