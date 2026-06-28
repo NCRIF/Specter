@@ -64,6 +64,7 @@ from ..libs.port.models import Cfg, ScanOut, SvcInfo
 from ..libs.port.network import DynamicSemaphore, sock_addr
 from ..libs.port.packets import (
     build_syn_packet,
+    build_syn_with_ip,
     parse_tcp_response,
 )
 from ..libs.port.parsers import (
@@ -209,6 +210,8 @@ class Scanner:
             return False
 
     def _ordered_ports(self) -> List[int]:
+        if len(self.cfg.ports) <= 100:
+            return list(self.cfg.ports)
         common = set(top_ports(min(1000, len(self.cfg.ports))))
         priority = [p for p in self.cfg.ports if p in common]
         rest = [p for p in self.cfg.ports if p not in common]
@@ -226,6 +229,18 @@ class Scanner:
                 "max_retries": self.cfg.max_retries,
                 "retry_budget": max(8, min(port_count // 8, 64)),
                 "timeout_floor": min(self.cfg.c_to, 0.50),
+            }
+
+        if port_count < LARGE_SCAN_PORT_THRESHOLD:
+            start_window = max(1, min(self.cfg.c_conc, max(128, min(port_count, 512))))
+            return {
+                "window": start_window,
+                "max_window": max(start_window, self.cfg.c_conc),
+                "min_window": max(64, min(start_window, 256)),
+                "increase": 16,
+                "max_retries": self.cfg.max_retries,
+                "retry_budget": max(8, min(port_count // 4, 64)),
+                "timeout_floor": min(self.cfg.c_to, 0.35),
             }
 
         if port_count >= 32768:
@@ -1826,6 +1841,266 @@ async def scan_quiet(
         globals()["console"] = orig_console
 
 
+async def _bulk_syn_probe(
+    per_target: Dict[str, Dict],
+    resolved: List[tuple],
+    ports: List[int],
+    timeout: float,
+    retries: int = 0,
+):
+    raw_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    raw_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    raw_sock.setblocking(False)
+
+    recv_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+    recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024)
+    try:
+        # SO_RCVBUFFORCE = 33, ignores rmem_max cap (needs CAP_NET_ADMIN/root)
+        recv_sock.setsockopt(socket.SOL_SOCKET, 33, 64 * 1024 * 1024)
+    except OSError:
+        pass
+    recv_sock.setblocking(False)
+
+    src_ip = "0.0.0.0"
+    try:
+        test = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for target, ip, family, _err in resolved:
+            if ip and family == socket.AF_INET:
+                test.connect((ip, 80))
+                src_ip = test.getsockname()[0]
+                break
+        test.close()
+    except Exception:
+        pass
+
+    next_port = random.randint(1024, 65535)
+    inflight: Dict[int, tuple] = {}
+
+    def _drain():
+        while True:
+            try:
+                data = recv_sock.recv(65535)
+            except (BlockingIOError, OSError):
+                break
+            resp = parse_tcp_response(data)
+            if not resp:
+                continue
+            resp_src, resp_dst, flags = resp
+            entry = inflight.get(resp_dst)
+            if entry is None:
+                continue
+            target, ip, port = entry
+            if resp_src != port:
+                continue
+            probes = per_target[target]["probes"]
+            if port in probes:
+                continue
+            if flags & 0x12 == 0x12:
+                per_target[target]["open"].append(port)
+                probes[port] = ("open", 0.0)
+            elif flags & 0x04:
+                probes[port] = ("closed", 0.0)
+
+    pairs = [
+        (target, ip, port)
+        for target, ip, family, _err in resolved
+        if ip and family == socket.AF_INET
+        for port in ports
+    ]
+
+    rounds = max(1, retries + 1)
+    for rnd in range(rounds):
+        pending = [
+            (target, ip, port)
+            for target, ip, port in pairs
+            if port not in per_target[target]["probes"]
+        ]
+        if not pending:
+            break
+        sent = 0
+        for target, ip, port in pending:
+            src_port = next_port
+            next_port = next_port + 1 if next_port < 65535 else 1024
+            pkt = build_syn_with_ip(src_ip, ip, src_port, port)
+            try:
+                raw_sock.sendto(pkt, (ip, 0))
+            except OSError:
+                continue
+            inflight[src_port] = (target, ip, port)
+            sent += 1
+            # smooth pacing: small batches avoid wifi/NAT microburst loss
+            if sent % 20 == 0:
+                time.sleep(0.004)
+                _drain()
+
+        deadline = time.perf_counter() + timeout
+        ep = select.epoll()
+        ep.register(recv_sock.fileno(), select.EPOLLIN)
+        _drain()
+        while time.perf_counter() < deadline:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            try:
+                events = ep.poll(remaining)
+            except Exception:
+                break
+            for fd, ev in events:
+                if ev & select.EPOLLIN:
+                    _drain()
+        ep.close()
+
+    raw_sock.close()
+    recv_sock.close()
+
+
+def _print_compact_host(result: dict):
+    ports = result.get("open_ports", [])
+    if not ports:
+        return
+    ports_str = ",".join(str(p) for p in ports)
+    line = f"  {result['target']}  →  [{ports_str}]"
+    print(line, flush=True)
+    for s in result.get("services", []):
+        svc_name = s.get("service", s.get("svc", "unknown"))
+        banner = s.get("info", "")[:80]
+        print(f"    :{s.get('port',0):<6} {svc_name:<14} {banner}", flush=True)
+
+
+def _scan_with_agents(targets, ports, timeout, agent_count, quiet, no_svc=False,
+                      retries=1, overlap=False):
+    from ..libs.agents import setup_agent_image, agents_spawn, agent_scan
+
+    extra = ["-N"] if no_svc else []
+
+    if not os.environ.get("SUDO_PASSWORD"):
+        console.print(Text("  ERROR  sudo password required for agent scan", style=RED))
+        return []
+
+    if not quiet:
+        console.print(Text(f"  Agents  {agent_count}  |  setting up", style=DIM))
+
+    if not setup_agent_image():
+        return []
+
+    agents = agents_spawn(agent_count)
+    if not agents:
+        return []
+
+    n = len(agents)
+    if os.environ.get("X3R0_AGENT_OVERLAP", "0") == "1":
+        overlap = True
+    elif os.environ.get("X3R0_AGENT_OVERLAP") == "0":
+        overlap = False
+    if overlap:
+        # every agent scans the full list from its own WARP exit IP;
+        # different vantage points reach different hosts -> union maximizes coverage
+        chunks = [list(targets) for _ in range(n)]
+    else:
+        chunk_size = max(1, len(targets) // n)
+        chunks = [targets[i:i + chunk_size] for i in range(0, len(targets), chunk_size)]
+        chunks = chunks[:n]
+
+    ports_str = ",".join(str(p) for p in ports)
+    import tempfile, json, shutil
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    tmpdir = tempfile.mkdtemp(prefix="spec_agents_")
+
+    def _run(agent_name, chunk, idx):
+        out_file = os.path.join(tmpdir, f"{agent_name}_{idx}.json")
+        code, stdout, stderr = agent_scan(
+            agent_name, chunk, ports_str, timeout, out_file, extra, retries
+        )
+        if code == 0:
+            try:
+                with open(out_file) as f:
+                    data = json.load(f)
+                return data if isinstance(data, list) else [data]
+            except Exception:
+                pass
+        return []
+
+    if not quiet:
+        mode = "overlap" if overlap else "partition"
+        console.print(Text(
+            f"  Agents  {n}  |  scanning {len(targets)} targets ({mode}, R={retries})",
+            style=DIM,
+        ))
+
+    # union by target: a port is open if ANY vantage point saw SYN-ACK
+    merged: Dict[str, dict] = {}
+
+    def _merge(item):
+        if not isinstance(item, dict) or "target" not in item:
+            return
+        tgt = item["target"]
+        cur = merged.get(tgt)
+        if cur is None:
+            merged[tgt] = item
+            return
+        op = set(cur.get("open_ports") or []) | set(item.get("open_ports") or [])
+        cur["open_ports"] = sorted(op)
+        if not cur.get("services") and item.get("services"):
+            cur["services"] = item["services"]
+        if not cur.get("ip") and item.get("ip"):
+            cur["ip"] = item["ip"]
+
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        futures = {
+            ex.submit(_run, agents[i], chunks[i], i): i for i in range(len(chunks))
+        }
+        for fut in as_completed(futures):
+            try:
+                r = fut.result()
+            except Exception:
+                continue
+            items = r if isinstance(r, list) else ([r] if r else [])
+            for item in items:
+                _merge(item)
+
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+    results = list(merged.values())
+    for item in results:
+        if item.get("open_ports"):
+            _print_compact_host(item)
+    return results
+
+
+def _show_compact(runs: List[ScanHit]):
+    opened = [r for r in runs if r.open_ports]
+    if not opened:
+        console.print(Text("  No open ports found.", style=DIM))
+        return
+    console.print()
+    for r in opened:
+        ports_str = ",".join(str(p) for p in r.open_ports)
+        console.print(
+            Text.assemble(
+                ("  ", DIM),
+                (r.target, f"bold {WHITE}"),
+                ("  →  [", DIM),
+                (ports_str, GREEN),
+                ("]", DIM),
+            )
+        )
+        if r.svcs:
+            for svc in r.svcs:
+                banner = svc.info[:80] if svc.info else ""
+                console.print(
+                    Text.assemble(
+                        ("    ", DIM),
+                        (f":{svc.port:<6}", CYAN),
+                        (f"{svc.svc:<14}", SVC_COL if svc.svc != "unknown" else DIM),
+                        (banner, DIMMER),
+                    )
+                )
+    console.print()
+    console.print(Text(f"  {len(opened)} hosts with open ports", style=DIM))
+    console.print()
+
+
 async def _scan_targets_parallel(
     targets: List[str],
     ports: List[int],
@@ -1841,6 +2116,7 @@ async def _scan_targets_parallel(
     verbose: int,
     target_concurrency: int,
     quiet: bool,
+    retries: int = 0,
 ) -> List:
     total = len(targets)
     started_all = datetime.now(timezone.utc)
@@ -1869,7 +2145,6 @@ async def _scan_targets_parallel(
     resolve_tasks = [asyncio.create_task(_resolve_one(t)) for t in targets]
     resolved = await asyncio.gather(*resolve_tasks)
 
-    connect_sem = asyncio.Semaphore(max(1, c_conc))
     per_target: Dict[str, Dict] = {}
 
     for target, ip, family, err in resolved:
@@ -1881,44 +2156,41 @@ async def _scan_targets_parallel(
             "err": err,
         }
 
-    async def _probe_one(target: str, ip: str, family: int, port: int):
-        if not ip or family == 0:
-            return (target, port, "closed", 0.0)
-        async with connect_sem:
-            t1 = time.perf_counter()
-            try:
-                _, writer = await asyncio.wait_for(
-                    asyncio.open_connection(ip, port, family=family),
-                    timeout=c_to,
-                )
-                writer.close()
-                if hasattr(writer, "wait_closed"):
+    if syn_scan:
+        await _bulk_syn_probe(per_target, resolved, ports, c_to, retries)
+    else:
+        connect_sem = asyncio.Semaphore(max(1, c_conc))
+        async def _probe_one(target, ip, family, port):
+            if not ip or family == 0:
+                return (target, port, "closed", 0.0)
+            async with connect_sem:
+                t1 = time.perf_counter()
+                try:
+                    _, writer = await asyncio.wait_for(
+                        asyncio.open_connection(ip, port, family=family),
+                        timeout=c_to,
+                    )
+                    writer.close()
                     try:
                         await asyncio.wait_for(writer.wait_closed(), timeout=0.2)
                     except Exception:
                         pass
-                return (target, port, "open", time.perf_counter() - t1)
-            except Exception:
-                return (target, port, "closed", time.perf_counter() - t1)
+                    return (target, port, "open", time.perf_counter() - t1)
+                except Exception:
+                    return (target, port, "closed", time.perf_counter() - t1)
 
-    probe_tasks = []
-    for target, ip, family, _err in resolved:
-        if not ip or family == 0:
-            continue
-        for port in ports:
-            probe_tasks.append(
-                asyncio.create_task(_probe_one(target, ip, family, port))
-            )
-
-    if not probe_tasks:
-        return []
-
-    probe_results = await asyncio.gather(*probe_tasks)
-
-    for target, port, state, elapsed in probe_results:
-        if state == "open":
-            per_target[target]["open"].append(port)
-        per_target[target]["probes"][port] = (state, elapsed)
+        probe_tasks = []
+        for target, ip, family, _err in resolved:
+            if not ip or family == 0:
+                continue
+            for port in ports:
+                probe_tasks.append(asyncio.create_task(_probe_one(target, ip, family, port)))
+        if probe_tasks:
+            probe_results = await asyncio.gather(*probe_tasks)
+            for target, port, state, elapsed in probe_results:
+                if state == "open":
+                    per_target[target]["open"].append(port)
+                per_target[target]["probes"][port] = (state, elapsed)
 
     if svc_on and not aggr_on:
         svc_sem = asyncio.Semaphore(max(1, s_conc))
@@ -1974,20 +2246,9 @@ async def _scan_targets_parallel(
             errors=errors,
         )
         completed += 1
-        if not quiet:
-            n_open = len(open_ports)
-            status = f"{n_open} open" if n_open else "no open ports"
-            color = GREEN if n_open else DIM
-            console.print(
-                Text.assemble(
-                    ("  [", DIM),
-                    (f"{completed}/{total}", WHITE),
-                    ("] ", DIM),
-                    (target, WHITE),
-                    ("  →  ", DIM),
-                    (status, color),
-                )
-            )
+        if not quiet and open_ports:
+            ports_str = ",".join(str(p) for p in open_ports)
+            print(f"  [{completed}/{total}] {target}  →  [{ports_str}]", flush=True)
 
     if not quiet:
         tag = f"bulk x{target_concurrency}" if target_concurrency else "bulk (uncapped)"
@@ -2033,6 +2294,16 @@ def run_cli(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> int
     args = parser.parse_args(argv)
 
     targets = [t.strip() for t in args.target if t.strip()]
+    if args.input_file:
+        try:
+            with open(args.input_file) as f:
+                for line in f:
+                    t = line.strip()
+                    if t and not t.startswith("#"):
+                        targets.append(t)
+        except OSError as err:
+            console.print(Text(f"  ERROR  Cannot read {args.input_file}: {err}", style=RED))
+            return 2
     if not targets:
         console.print(Text("  ERROR  No target specified.", style=RED))
         return 2
@@ -2125,6 +2396,27 @@ def run_cli(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> int
             console.print(Text("  ERROR  sudo authentication failed.", style=RED))
             return 2
 
+    if args.agents > 0 and not os.environ.get("SUDO_PASSWORD"):
+        console.print()
+        console.print(Text("  Agent scan needs sudo for nsenter.", style=YELLOW))
+        try:
+            agent_pw = getpass.getpass("  sudo password: ")
+        except (EOFError, KeyboardInterrupt):
+            agent_pw = ""
+        if not agent_pw:
+            console.print(Text("  ERROR  sudo password required for agent scan", style=RED))
+            return 2
+        check = subprocess.run(
+            ["sudo", "-S", "-p", "", "-v"],
+            input=agent_pw + "\n",
+            text=True,
+            capture_output=True,
+        )
+        if check.returncode != 0:
+            console.print(Text("  ERROR  sudo authentication failed.", style=RED))
+            return 2
+        os.environ["SUDO_PASSWORD"] = agent_pw
+
     # determine ports to scan
     if args.all_ports:
         sel = list(range(1, 65536))
@@ -2158,7 +2450,8 @@ def run_cli(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> int
         max_retries=args.retries,
     )
     if not args.quiet:
-        hdr(targets, len(sel), scan_cfg)
+        display = [args.input_file] if args.input_file else targets
+        hdr(display, len(sel), scan_cfg)
 
     if len(targets) == 1:
         runs: List[ScanHit] = []
@@ -2189,24 +2482,33 @@ def run_cli(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> int
         runs.append(scan)
         show_scan(scan, idx=0, total=1, verbose=args.v)
     else:
-        raw = asyncio.run(
-            _scan_targets_parallel(
-                targets=targets,
-                ports=sel,
-                c_conc=args.concurrency,
-                c_to=args.timeout,
-                s_conc=args.svc_concurrency,
-                n_args=parsed_n_args,
-                svc_on=not args.no_svc_scan,
-                aggr_on=use_nmap_service_detection,
-                sudo_pw=sudo_pw,
-                stealth=args.stealth,
-                syn_scan=use_syn_scan,
-                verbose=args.v,
-                target_concurrency=args.target_concurrency,
-                quiet=args.quiet,
+        if args.agents > 0:
+            raw = _scan_with_agents(
+                targets=targets, ports=sel, timeout=args.timeout,
+                agent_count=args.agents, quiet=args.quiet,
+                no_svc=args.no_svc_scan,
+                retries=args.retries,
             )
-        )
+        else:
+            raw = asyncio.run(
+                _scan_targets_parallel(
+                    targets=targets,
+                    ports=sel,
+                    c_conc=args.concurrency,
+                    c_to=args.timeout,
+                    s_conc=args.svc_concurrency,
+                    n_args=parsed_n_args,
+                    svc_on=not args.no_svc_scan,
+                    aggr_on=use_nmap_service_detection,
+                    sudo_pw=sudo_pw,
+                    stealth=args.stealth,
+                    syn_scan=use_syn_scan,
+                    verbose=args.v,
+                    target_concurrency=args.target_concurrency,
+                    quiet=args.quiet,
+                    retries=args.retries,
+                )
+            )
         runs = []
         for i, result in enumerate(raw):
             if isinstance(result, Exception):
@@ -2217,10 +2519,40 @@ def run_cli(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> int
                 continue
             if isinstance(result, ScanHit):
                 runs.append(result)
-                show_scan(result, idx=len(runs) - 1, total=len(targets), verbose=args.v)
+            elif isinstance(result, dict) and "target" in result:
+                svc_list = []
+                for s in result.get("services", []):
+                    svc_list.append(SvcInfo(
+                        port=s.get("port", 0),
+                        ok=s.get("ok", True),
+                        state=s.get("state", "open"),
+                        svc=s.get("service", s.get("svc", "unknown")),
+                        info=s.get("info", ""),
+                        elapsed=s.get("elapsed_sec", s.get("elapsed", 0)),
+                        n_cmd=s.get("nmap_cmd", s.get("n_cmd", "")),
+                        raw=s.get("raw", ""),
+                        err=s.get("err"),
+                    ))
+                runs.append(ScanHit(
+                    target=result["target"],
+                    ip=result.get("ip", ""),
+                    req_ports=result.get("req_ports", sel),
+                    open_ports=result.get("open_ports", []),
+                    svcs=svc_list,
+                    started=result.get("started", ""),
+                    finished=result.get("finished", ""),
+                    elapsed=result.get("elapsed_sec", result.get("elapsed", 0)),
+                    errors=result.get("errors", []),
+                ))
 
-    # show multi-target summary
-    show_multi_sum(runs)
+    if len(targets) > 1:
+        opened = [r for r in runs if r.open_ports]
+        total_ports = sum(len(r.open_ports) for r in runs)
+        console.print()
+        console.print(Text(f"  {len(opened)}/{len(runs)} hosts open, {total_ports} ports total", style=f"bold {CYAN}"))
+        console.print()
+    elif runs:
+        show_scan(runs[0], idx=0, total=1, verbose=args.v)
 
     # write json or html output
     if args.out and runs:
