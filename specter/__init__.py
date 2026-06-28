@@ -4,7 +4,7 @@ top-level package metadata for specter
 
 from importlib.metadata import PackageNotFoundError, version
 
-_PKG_NAME = "x3r0day-specter"
+_PKG_NAME = "specter"
 
 try:
     __version__ = version(_PKG_NAME)
