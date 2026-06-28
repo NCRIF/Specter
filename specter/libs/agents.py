@@ -85,7 +85,8 @@ def agents_spawn(count, image=DEFAULT_IMAGE, prefix=DEFAULT_PREFIX):
     return _agent_names(prefix)[:count]
 
 
-def agent_scan(name, targets, ports_str, timeout, out_file, extra_args=None, retries=1):
+def agent_scan(name, targets, ports_str, timeout, out_file, extra_args=None, retries=1,
+               batch=20, batch_delay_ms=4.0):
     pid = _docker(["inspect", "-f", "{{.State.Pid}}", name], timeout=10)
     if pid[0] != 0 or not pid[1].strip():
         return 1, "", "no pid"
@@ -99,6 +100,7 @@ def agent_scan(name, targets, ports_str, timeout, out_file, extra_args=None, ret
         "-p", ports_str,
         "-t", str(timeout),
         "-q", "--syn-scan", "-R", str(retries),
+        "--batch", str(batch), "--batch-delay", str(batch_delay_ms),
     ]
     if extra_args:
         nsenter_cmd.extend(extra_args)

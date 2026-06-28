@@ -2,6 +2,7 @@
 
 
 import asyncio
+import atexit
 import getpass
 import ipaddress
 import io
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import select
+import signal
 from rich.console import Console
 from rich.live import Live
 from rich.progress import Progress
@@ -66,6 +68,7 @@ from ..libs.port.packets import (
     build_syn_packet,
     build_syn_with_ip,
     parse_tcp_response,
+    parse_tcp_response_full,
 )
 from ..libs.port.parsers import (
     grab_nmap_block,
@@ -1841,21 +1844,103 @@ async def scan_quiet(
         globals()["console"] = orig_console
 
 
+_scan_fw_ports: set = set()
+_scan_fw_installed = False
+
+
+def _fw_rule(action: str, dport: int):
+    # add/remove an INPUT DROP for replies arriving at our scan source port.
+    # this stops the kernel from RSTing the half-open connection and from
+    # creating conntrack state. AF_PACKET capture still sees the packet since
+    # it runs below netfilter. matches masscan's --source-port + iptables trick.
+    cmd = [
+        "iptables", action, "INPUT", "-p", "tcp",
+        "--dport", str(dport), "-j", "DROP",
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+def _fw_cleanup():
+    # remove every rule we added. block SIGINT during removal so repeated
+    # Ctrl+C can't abort the cleanup and leave a rule behind. idempotent.
+    if not _scan_fw_ports:
+        return
+    try:
+        prev = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (ValueError, OSError):
+        prev = None
+    try:
+        while _scan_fw_ports:
+            _fw_rule("-D", _scan_fw_ports.pop())
+    finally:
+        if prev is not None:
+            try:
+                signal.signal(signal.SIGINT, prev)
+            except (ValueError, OSError):
+                pass
+
+
+def _fw_install_guard():
+    # ensure cleanup runs on every exit path:
+    #   - normal return / unhandled exception -> finally block in the scanner
+    #   - process exit                         -> atexit
+    #   - SIGINT (Ctrl+C)                       -> default KeyboardInterrupt
+    #                                             unwinds through finally + atexit
+    #   - SIGTERM / SIGHUP                      -> converted to SystemExit, which
+    #                                             also unwinds finally + atexit
+    # the signal handler does NO real work (no subprocess) to avoid deadlocking
+    # inside the asyncio event loop; it only raises.
+    global _scan_fw_installed
+    if _scan_fw_installed:
+        return
+    _scan_fw_installed = True
+    atexit.register(_fw_cleanup)
+
+    def _term_handler(signum, frame):
+        raise SystemExit(128 + signum)
+
+    for s in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(s, _term_handler)
+        except (ValueError, OSError):
+            pass  # not main thread; atexit + finally still cover us
+
+
+def _fw_add(dport: int) -> bool:
+    if os.geteuid() != 0:
+        return False
+    if shutil.which("iptables") is None:
+        return False
+    _fw_install_guard()
+    _scan_fw_ports.add(dport)
+    _fw_rule("-A", dport)
+    return True
+
+
 async def _bulk_syn_probe(
     per_target: Dict[str, Dict],
     resolved: List[tuple],
     ports: List[int],
     timeout: float,
     retries: int = 0,
+    batch: int = 20,
+    batch_delay_ms: float = 4.0,
+    on_open=None,
 ):
     raw_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
     raw_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
     raw_sock.setblocking(False)
 
-    recv_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+    # receive via AF_PACKET (link layer, below netfilter) like masscan/libpcap.
+    # this lets us drop the kernel's view of replies in INPUT (no RST, no
+    # conntrack) while still capturing every SYN-ACK ourselves.
+    ETH_P_IP = 0x0800
+    recv_sock = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(ETH_P_IP))
     recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024)
     try:
-        # SO_RCVBUFFORCE = 33, ignores rmem_max cap (needs CAP_NET_ADMIN/root)
         recv_sock.setsockopt(socket.SOL_SOCKET, 33, 64 * 1024 * 1024)
     except OSError:
         pass
@@ -1873,31 +1958,49 @@ async def _bulk_syn_probe(
     except Exception:
         pass
 
-    next_port = random.randint(1024, 65535)
-    inflight: Dict[int, tuple] = {}
+    # single fixed source port for the whole scan: lets the INPUT-DROP rule be
+    # precise (only our scan's replies), and replies are matched by responder
+    # ip:port so we never depend on a per-probe source port.
+    scan_sport = random.randint(40000, 60000)
+    fw_active = _fw_add(scan_sport)
+
+    PACKET_OUTGOING = 4
+    # map responder identity (target_ip, target_port) -> our target key.
+    ip_target: Dict[str, str] = {}
+    port_set = set(ports)
+    for target, ip, family, _err in resolved:
+        if ip and family == socket.AF_INET:
+            ip_target[ip] = target
 
     def _drain():
         while True:
             try:
-                data = recv_sock.recv(65535)
+                data, addr = recv_sock.recvfrom(65535)
             except (BlockingIOError, OSError):
                 break
-            resp = parse_tcp_response(data)
+            # addr[2] is the packet type; skip our own outgoing copies
+            if len(addr) > 2 and addr[2] == PACKET_OUTGOING:
+                continue
+            resp = parse_tcp_response_full(data)
             if not resp:
                 continue
-            resp_src, resp_dst, flags = resp
-            entry = inflight.get(resp_dst)
-            if entry is None:
+            resp_ip, resp_sport, resp_dport, flags = resp
+            # only consider replies addressed to our scan source port
+            if resp_dport != scan_sport:
                 continue
-            target, ip, port = entry
-            if resp_src != port:
+            # the reply's source ip:port IS the scanned target ip:port
+            target = ip_target.get(resp_ip)
+            if target is None or resp_sport not in port_set:
                 continue
+            port = resp_sport
             probes = per_target[target]["probes"]
             if port in probes:
                 continue
             if flags & 0x12 == 0x12:
                 per_target[target]["open"].append(port)
                 probes[port] = ("open", 0.0)
+                if on_open is not None:
+                    on_open(target, resp_ip, port)
             elif flags & 0x04:
                 probes[port] = ("closed", 0.0)
 
@@ -1908,50 +2011,50 @@ async def _bulk_syn_probe(
         for port in ports
     ]
 
-    rounds = max(1, retries + 1)
-    for rnd in range(rounds):
-        pending = [
-            (target, ip, port)
-            for target, ip, port in pairs
-            if port not in per_target[target]["probes"]
-        ]
-        if not pending:
-            break
-        sent = 0
-        for target, ip, port in pending:
-            src_port = next_port
-            next_port = next_port + 1 if next_port < 65535 else 1024
-            pkt = build_syn_with_ip(src_ip, ip, src_port, port)
-            try:
-                raw_sock.sendto(pkt, (ip, 0))
-            except OSError:
-                continue
-            inflight[src_port] = (target, ip, port)
-            sent += 1
-            # smooth pacing: small batches avoid wifi/NAT microburst loss
-            if sent % 20 == 0:
-                time.sleep(0.004)
-                _drain()
-
-        deadline = time.perf_counter() + timeout
-        ep = select.epoll()
-        ep.register(recv_sock.fileno(), select.EPOLLIN)
-        _drain()
-        while time.perf_counter() < deadline:
-            remaining = deadline - time.perf_counter()
-            if remaining <= 0:
+    try:
+        rounds = max(1, retries + 1)
+        for rnd in range(rounds):
+            pending = [
+                (target, ip, port)
+                for target, ip, port in pairs
+                if port not in per_target[target]["probes"]
+            ]
+            if not pending:
                 break
-            try:
-                events = ep.poll(remaining)
-            except Exception:
-                break
-            for fd, ev in events:
-                if ev & select.EPOLLIN:
+            sent = 0
+            for target, ip, port in pending:
+                pkt = build_syn_with_ip(src_ip, ip, scan_sport, port)
+                try:
+                    raw_sock.sendto(pkt, (ip, 0))
+                except OSError:
+                    continue
+                sent += 1
+                # smooth pacing: small batches avoid wifi/NAT microburst loss
+                if batch > 0 and sent % batch == 0:
+                    time.sleep(batch_delay_ms / 1000.0)
                     _drain()
-        ep.close()
 
-    raw_sock.close()
-    recv_sock.close()
+            deadline = time.perf_counter() + timeout
+            ep = select.epoll()
+            ep.register(recv_sock.fileno(), select.EPOLLIN)
+            _drain()
+            while time.perf_counter() < deadline:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                try:
+                    events = ep.poll(remaining)
+                except Exception:
+                    break
+                for fd, ev in events:
+                    if ev & select.EPOLLIN:
+                        _drain()
+            ep.close()
+    finally:
+        raw_sock.close()
+        recv_sock.close()
+        if fw_active:
+            _fw_cleanup()
 
 
 def _print_compact_host(result: dict):
@@ -1968,7 +2071,7 @@ def _print_compact_host(result: dict):
 
 
 def _scan_with_agents(targets, ports, timeout, agent_count, quiet, no_svc=False,
-                      retries=1, overlap=False):
+                      retries=1, overlap=False, batch=20, batch_delay_ms=4.0):
     from ..libs.agents import setup_agent_image, agents_spawn, agent_scan
 
     extra = ["-N"] if no_svc else []
@@ -2010,7 +2113,8 @@ def _scan_with_agents(targets, ports, timeout, agent_count, quiet, no_svc=False,
     def _run(agent_name, chunk, idx):
         out_file = os.path.join(tmpdir, f"{agent_name}_{idx}.json")
         code, stdout, stderr = agent_scan(
-            agent_name, chunk, ports_str, timeout, out_file, extra, retries
+            agent_name, chunk, ports_str, timeout, out_file, extra, retries,
+            batch, batch_delay_ms,
         )
         if code == 0:
             try:
@@ -2050,6 +2154,7 @@ def _scan_with_agents(targets, ports, timeout, agent_count, quiet, no_svc=False,
         futures = {
             ex.submit(_run, agents[i], chunks[i], i): i for i in range(len(chunks))
         }
+        printed: set = set()
         for fut in as_completed(futures):
             try:
                 r = fut.result()
@@ -2058,13 +2163,20 @@ def _scan_with_agents(targets, ports, timeout, agent_count, quiet, no_svc=False,
             items = r if isinstance(r, list) else ([r] if r else [])
             for item in items:
                 _merge(item)
+                # stream hosts the moment the agent that found them finishes
+                if not quiet and isinstance(item, dict) and item.get("open_ports"):
+                    tgt = item.get("target")
+                    if tgt not in printed:
+                        printed.add(tgt)
+                        _print_compact_host(merged.get(tgt, item))
 
     shutil.rmtree(tmpdir, ignore_errors=True)
 
     results = list(merged.values())
-    for item in results:
-        if item.get("open_ports"):
-            _print_compact_host(item)
+    if quiet:
+        for item in results:
+            if item.get("open_ports"):
+                _print_compact_host(item)
     return results
 
 
@@ -2117,6 +2229,8 @@ async def _scan_targets_parallel(
     target_concurrency: int,
     quiet: bool,
     retries: int = 0,
+    batch: int = 20,
+    batch_delay_ms: float = 4.0,
 ) -> List:
     total = len(targets)
     started_all = datetime.now(timezone.utc)
@@ -2157,7 +2271,15 @@ async def _scan_targets_parallel(
         }
 
     if syn_scan:
-        await _bulk_syn_probe(per_target, resolved, ports, c_to, retries)
+        stream_open = None
+        if not quiet:
+            def stream_open(target, ip, port):
+                label = target if target == ip else f"{target} ({ip})"
+                print(f"  {label:<28}  →  {port}  open", flush=True)
+        await _bulk_syn_probe(
+            per_target, resolved, ports, c_to, retries, batch, batch_delay_ms,
+            on_open=stream_open,
+        )
     else:
         connect_sem = asyncio.Semaphore(max(1, c_conc))
         async def _probe_one(target, ip, family, port):
@@ -2488,6 +2610,8 @@ def run_cli(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> int
                 agent_count=args.agents, quiet=args.quiet,
                 no_svc=args.no_svc_scan,
                 retries=args.retries,
+                batch=args.batch,
+                batch_delay_ms=args.batch_delay,
             )
         else:
             raw = asyncio.run(
@@ -2507,6 +2631,8 @@ def run_cli(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> int
                     target_concurrency=args.target_concurrency,
                     quiet=args.quiet,
                     retries=args.retries,
+                    batch=args.batch,
+                    batch_delay_ms=args.batch_delay,
                 )
             )
         runs = []

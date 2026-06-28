@@ -91,3 +91,17 @@ def parse_tcp_response(data: bytes) -> Optional[tuple]:
         return values[0], values[1], values[5]
     except Exception:
         return None
+
+
+def parse_tcp_response_full(data: bytes) -> Optional[tuple]:
+    # returns (src_ip, src_port, dst_port, flags) for bulk matching by responder IP
+    try:
+        ihl = (data[0] & 0x0F) * 4
+        src_ip = socket.inet_ntoa(data[12:16])
+        tcp_header = data[ihl : ihl + 20]
+        if len(tcp_header) < 20:
+            return None
+        values = struct.unpack("!HHIIBBHHH", tcp_header)
+        return src_ip, values[0], values[1], values[5]
+    except Exception:
+        return None

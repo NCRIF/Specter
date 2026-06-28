@@ -659,6 +659,20 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
         help="spawn N WARP agents to split scan across unique IPs (requires docker)",
     )
     p.add_argument(
+        "--batch",
+        type=int,
+        default=20,
+        metavar="N",
+        help="SYN scan: packets to send per burst before pausing (default: 20)",
+    )
+    p.add_argument(
+        "--batch-delay",
+        type=float,
+        default=4.0,
+        metavar="MS",
+        help="SYN scan: pause in milliseconds between bursts (default: 4.0)",
+    )
+    p.add_argument(
         "-S",
         "--aggr-svc-scan",
         action="store_true",
