@@ -109,18 +109,18 @@ def parse_nmap_row(out: str):
         return None
     return rows[sorted(rows)[0]]
 
-def top_ports(n: int) -> List[int]:
-    """
-    This returns the top N most frequently open ports
-    These are sourced from NMAP service database
-    In case the db is not there,
-    it just fallbacks to 1...N
+_top_ports_cache: Optional[List[int]] = None
 
-    Args:
-        n: Number of ports to return >= 65536
-    """
-    # nmap db has all the services listed
-    # we iterate through them and use whatever we find first
+def top_ports(n: int) -> List[int]:
+    global _top_ports_cache
+    if _top_ports_cache is None:
+        _top_ports_cache = _load_top_ports(max_n=65535)
+    if n >= len(_top_ports_cache):
+        return list(_top_ports_cache)
+    return _top_ports_cache[:n]
+
+
+def _load_top_ports(max_n: int) -> List[int]:
     for db_path in NMAP_DB:
         p = Path(db_path)
         if not p.exists():
@@ -173,17 +173,13 @@ def top_ports(n: int) -> List[int]:
                 if port not in seen:
                     res.append(port)
                     seen.add(port)
-                    if len(res) >= n:
+                    if len(res) >= max_n:
                         break
 
             if res:
                 return res
 
-    # db not found
-    # so we just return
-    # sequential ports
-    # like (1,2,3,4,..,N)
-    return list(range(1, min(n, 65535) + 1))
+    return list(range(1, min(max_n, 65535) + 1))
 
 def parse_ports(raw: Optional[str]) -> List[int]:
     # default to well-known ports (1-1024) if nothing given

@@ -46,24 +46,39 @@ def build_tcp_pseudo_header(src_ip: str, dst_ip: str, tcp_len: int) -> bytes:
 
 def build_syn_packet(src_ip: str, dst_ip: str, src_port: int, dst_port: int) -> bytes:
     seq = random.randint(0, 0xFFFFFFFF)
-    tcp_header = build_tcp_header(src_port, dst_port, seq, 0, 0x02)
+    opts = struct.pack("!BBH", 2, 4, 1460)
+    data_offset = ((20 + len(opts)) // 4) << 4
+    tcph = struct.pack(
+        "!HHIIBBHHH",
+        src_port, dst_port, seq, 0,
+        data_offset, 0x02,
+        64240, 0, 0,
+    ) + opts
     checksum_val = checksum(
-        build_tcp_pseudo_header(src_ip, dst_ip, len(tcp_header)) + tcp_header
+        build_tcp_pseudo_header(src_ip, dst_ip, len(tcph)) + tcph
     )
-    return (
-        struct.pack(
-            "!HHIIBBH",
-            src_port,
-            dst_port,
-            seq,
-            0,
-            5 << 4,
-            0x02,
-            socket.htons(65535),
-        )
-        + struct.pack("!H", checksum_val)
-        + struct.pack("!H", 0)
+    return tcph[:16] + struct.pack("!H", checksum_val) + tcph[18:]
+
+
+def build_syn_with_ip(src_ip: str, dst_ip: str, src_port: int, dst_port: int) -> bytes:
+    tcph = build_syn_packet(src_ip, dst_ip, src_port, dst_port)
+    ident = random.randint(0, 0xFFFF)
+    iph = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45, 0, 20 + len(tcph),
+        ident,
+        0x4000, 64, socket.IPPROTO_TCP, 0,
+        socket.inet_aton(src_ip), socket.inet_aton(dst_ip),
     )
+    ip_csum = checksum(iph)
+    iph = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45, 0, 20 + len(tcph),
+        ident,
+        0x4000, 64, socket.IPPROTO_TCP, ip_csum,
+        socket.inet_aton(src_ip), socket.inet_aton(dst_ip),
+    )
+    return iph + tcph
 
 
 def parse_tcp_response(data: bytes) -> Optional[tuple]:

@@ -599,7 +599,8 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    p.add_argument("target", nargs="+", help="target hostnames / ips")
+    p.add_argument("target", nargs="*", help="target hostnames / ips")
+    p.add_argument("-iL", "--input-file", default=None, help="read targets from file, one per line")
     p.add_argument("-p", "--ports", default=None, help="ports: 22,80,443  or  1-1024")
     p.add_argument(
         "-P",
@@ -647,7 +648,15 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
         type=int,
         default=1,
         metavar="N",
-        help="max retries per port on timeout (default: 1, set 0 for speed)",
+        help="retries/retransmit rounds for unanswered probes (default: 1; higher finds more hosts on lossy links)",
+    )
+    p.add_argument(
+        "-A",
+        "--agents",
+        type=int,
+        default=0,
+        metavar="N",
+        help="spawn N WARP agents to split scan across unique IPs (requires docker)",
     )
     p.add_argument(
         "-S",
