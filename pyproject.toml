@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "x3r0day-specter"
-version = "2.0.0"
+version = "2.1.0"
 description = "Subdomain enumeration and TCP port scanning."
 readme = "README.md"
 requires-python = ">=3.10"
